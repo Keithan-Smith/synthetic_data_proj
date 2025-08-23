@@ -24,7 +24,7 @@ class HybridGenerator:
         # 2) Fit VAE on standardized continuous
         Xc = torch.tensor(df[self.cont_cols].to_numpy(), dtype=torch.float32)
         self.vae = TabularVAE(input_dim=Xc.shape[1]).to(self.device)
-        opt = torch.optim.Adam(self.vae.parameters(), lr=1e-3)
+        opt = torch.optim.Adam(self.vae.parameters(), lr=1e-5)
         loader = DataLoader(TensorDataset(Xc), batch_size=batch, shuffle=True)
         self.vae.train()
         for _ in range(epochs_vae):
