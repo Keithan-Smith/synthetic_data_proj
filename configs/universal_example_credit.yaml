@@ -1,0 +1,41 @@
+mode: "learned"
+adapter: "universal"
+data_source: ucimlrepo   # optional
+uci_id: 144
+
+# data_path: "/path/to/credit.csv" # optional
+
+# Optional: map CSV columns -> canonical names
+column_map: "column_map_credit.yaml"
+
+# Alias pack helps recognize common credit names without hardcoding
+domain_pack: "synthetic_data_proj/data/aliases/credit.yaml"
+
+output_dir: "synthetic_data_proj/outputs/credit_data.csv"
+seed: 242
+device: "cuda"
+
+# Pluggable downstream task
+task: "credit_portfolio"   # use "none" for datasets without portfolio simulation
+
+months: 18
+start_date: "2019-01-31"
+init_customers: 100000
+base_new: 120
+
+training_profile: thorough   # fast | balanced | thorough
+
+# (Optional) override profile defaults
+# vae_epochs: 25
+# gan_epochs: 80
+# batch_size: 1024
+
+# Privacy knobs
+privacy_enabled: false
+dp_max_grad_norm: 1.0
+dp_noise_multiplier: 0.0
+dp_delta: 1e-5
+
+# Hazard tuning (credit only)
+pd_logit_shift: 0.0
+macro_pd_mult: 8.0
