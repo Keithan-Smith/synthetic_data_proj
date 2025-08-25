@@ -1,0 +1,15 @@
+# Map CSV columns to canonical names used by the pipeline.
+map:
+  Credit amount: loan_amount
+  Duration: loan_term
+  Rate: interest_rate
+  Annual Income: income
+  Age: age
+  Dependents: number_of_dependents
+  Existing Credits: existing_credits
+  Residence Years: residence_since
+  Installment %: installment_rate_pct
+  Orig Date: loan_origination_date
+  Customer ID: customer_id
+  Borrower: name
+  Default: bad_within_horizon
