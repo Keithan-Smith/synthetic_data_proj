@@ -1,41 +1,65 @@
 mode: "learned"
 adapter: "universal"
-data_source: ucimlrepo   # optional
+
+data_source: "ucimlrepo"
 uci_id: 144
 
-# data_path: "/path/to/credit.csv" # optional
+# Optional remap/aliases (comment out if not present)
+# column_map: "configs/column_map_credit.yaml"
+# domain_pack: "data/aliases/credit.yaml"
 
-# Optional: map CSV columns -> canonical names
-column_map: "column_map_credit.yaml"
-
-# Alias pack helps recognize common credit names without hardcoding
-domain_pack: "synthetic_data_proj/data/aliases/credit.yaml"
-
-output_dir: "synthetic_data_proj/outputs/credit_data.csv"
+output_dir: "outputs/credit_run"
 seed: 242
 device: "cuda"
 
-# Pluggable downstream task
-task: "credit_portfolio"   # use "none" for datasets without portfolio simulation
-
+task: "credit_portfolio"
 months: 18
 start_date: "2019-01-31"
 init_customers: 100000
 base_new: 120
 
-training_profile: thorough   # fast | balanced | thorough
+training_profile: thorough
 
-# (Optional) override profile defaults
-# vae_epochs: 25
-# gan_epochs: 80
-# batch_size: 1024
-
-# Privacy knobs
 privacy_enabled: false
 dp_max_grad_norm: 1.0
 dp_noise_multiplier: 0.0
 dp_delta: 1e-5
 
-# Hazard tuning (credit only)
 pd_logit_shift: 0.0
 macro_pd_mult: 8.0
+
+pdcal:
+  mode: auto            # auto (recommended) | fixed
+  horizon_months: 12    # PD horizon -> simulator converts to monthly hazard
+  max_cont: 8           # max numeric features to use (auto mode)
+  max_cat: 8            # max categorical features to use (auto mode)
+  max_cat_levels: 30    # drop cats with too many levels (avoids huge one-hots)
+  include: []           # optional regexes to force-include (e.g., ["^age$", "^income$"])
+  exclude: ["^id$", "^index$", "^name$"]  # regexes to exclude junk cols
+  
+shock_enabled: false
+
+# >>> SHOCKS <<<
+shock:
+  corr_shrink: 0.25
+  # either list of triples:
+  corr_pairs:
+    - [income, loan_amount, 0.6]
+    - [age, loan_amount, -0.2]
+  # or as a dict with string keys "(col_i,col_j)": rho
+  # corr_pairs:
+  #   "(income,loan_amount)": 0.6
+
+  cont_mu_shift:
+    income: 1000
+
+  cont_scale:
+    loan_amount: 1.1
+
+  residual_scale: 1.2
+
+  # categorical biases: use your category VALUES (e.g., German A-codes)
+  cat_logit_bias:
+    purpose:
+      A40: 0.5     # tilt towards "car (new)"
+      A45: -0.2    # tilt away from "repairs"
