@@ -1,30 +1,68 @@
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, brier_score_loss
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 
-def _find_binary_target(df: pd.DataFrame):
-    preferred = ["bad_within_horizon","mortality_30d","readmission_30d","target","label","class","default","bad"]
-    for p in preferred:
-        if p in df.columns and df[p].dropna().nunique() == 2:
-            return p
+_PREFERRED = ["bad_within_horizon","default","default_flag","class","label","target"]
+
+def _binarize(s: pd.Series) -> pd.Series:
+    if s.dtype == object:
+        sl = s.astype(str).str.lower()
+        if set(sl.unique()) <= {"good","bad"}:   return (sl=="bad").astype(int)
+        if set(sl.unique()) <= {"yes","no"}:     return (sl=="yes").astype(int)
+        if set(sl.unique()) <= {"true","false"}: return (sl=="true").astype(int)
+    vals = set(pd.unique(s))
+    if vals <= {1,2}: return s.map({1:0,2:1})
+    return s.astype(int)
+
+def _pick_target(df: pd.DataFrame) -> str:
+    for c in _PREFERRED:
+        if c in df.columns: return c
+    # fallback: any binary column
     for c in df.columns:
-        if df[c].dropna().nunique() == 2:
-            return c
-    return None
+        if df[c].dropna().nunique()==2: return c
+    raise ValueError("No binary target column found.")
 
-def generic_binary_downstream_eval(train_df: pd.DataFrame, test_df: pd.DataFrame):
-    tgt = _find_binary_target(test_df)
-    if not tgt or tgt not in train_df.columns or tgt not in test_df.columns:
-        return {"auc": float('nan'), "brier": float('nan')}
-    feats = [c for c in train_df.columns if c in test_df.columns and pd.api.types.is_numeric_dtype(train_df[c]) and c != tgt]
-    if not feats:
-        return {"auc": float('nan'), "brier": float('nan')}
-    Xtr = train_df[feats].to_numpy(); ytr = train_df[tgt].to_numpy()
-    Xte = test_df[feats].to_numpy();  yte = test_df[tgt].to_numpy()
-    if len(np.unique(ytr)) < 2 or len(np.unique(yte)) < 2:
-        return {"auc": float('nan'), "brier": float('nan')}
-    clf = LogisticRegression(max_iter=200).fit(Xtr, ytr)
-    proba = clf.predict_proba(Xte)[:,1]
-    auc = roc_auc_score(yte, proba); brier = brier_score_loss(yte, proba)
-    return {"auc": float(auc), "brier": float(brier)}
+def generic_binary_downstream_eval(train_df: pd.DataFrame, test_df: pd.DataFrame, target_col: str = None):
+    # target selection
+    if target_col is None:
+        target_col = _pick_target(train_df)
+        # ensure also exists in test_df
+        if target_col not in test_df.columns:
+            # try test_df pick; then align
+            t2 = _pick_target(test_df)
+            if t2 != target_col:
+                # align by creating the chosen name on whichever is missing
+                if target_col not in test_df.columns:
+                    test_df = test_df.copy()
+                    test_df[target_col] = _binarize(test_df[t2])
+
+    # split features/labels
+    y_tr = _binarize(train_df[target_col])
+    y_te = _binarize(test_df[target_col])
+
+    X_tr = train_df.drop(columns=[target_col], errors='ignore').select_dtypes(include=[np.number])
+    X_te = test_df.drop(columns=[target_col],  errors='ignore').select_dtypes(include=[np.number])
+
+    # align numeric columns
+    common = [c for c in X_tr.columns if c in X_te.columns]
+    if not common:
+        return {"auc": None, "brier": None, "note":"No overlapping numeric features."}
+    X_tr = X_tr[common].fillna(X_tr.median(numeric_only=True))
+    X_te = X_te[common].fillna(X_tr.median(numeric_only=True))
+
+    # scale + LR
+    sc = StandardScaler()
+    X_trs = sc.fit_transform(X_tr)
+    X_tes = sc.transform(X_te)
+
+    lr = LogisticRegression(solver="lbfgs", max_iter=2000, class_weight="balanced")
+    lr.fit(X_trs, y_tr)
+    p = lr.predict_proba(X_tes)[:,1]
+
+    return {
+        "auc":  float(roc_auc_score(y_te, p)),
+        "brier": float(brier_score_loss(y_te, p))
+    }
