@@ -364,7 +364,9 @@ def run(cfg_path: str):
         if hasattr(hg, 'train_eps_log'): f.write(f"DP eps log: {hg.train_eps_log}\n")
 
     try:
-        plot_histograms(df, syn_o, cont_cols[:6], out)
+        viz_top_k = getattr(cfg, "viz_top_k", None)
+        cols_to_plot = cont_cols if viz_top_k is None else cont_cols[:viz_top_k]
+        plot_histograms(df, syn_o, cols_to_plot, out)
         plot_corr(df, syn_o, cont_eval[:8], out)
         plot_pca(df, syn_o, cont_eval, out)
         build_report(out)

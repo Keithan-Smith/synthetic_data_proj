@@ -25,8 +25,16 @@ dp_max_grad_norm: 1.0
 dp_noise_multiplier: 0.0
 dp_delta: 1e-5
 
-pd_logit_shift: 0.0
-macro_pd_mult: 8.0
+# Treat small-cardinality ints as categorical; set columns explicitly for German
+cont_cols: ["Attribute2","Attribute5","Attribute13"]             # Duration, Credit amount, Age
+cat_cols:  ["Attribute1","Attribute3","Attribute4","Attribute6",
+            "Attribute7","Attribute8","Attribute9","Attribute10",
+            "Attribute11","Attribute12","Attribute14","Attribute15",
+            "Attribute16","Attribute17","Attribute19","Attribute20"]
+
+# Per-column transforms (handled by your schema utils)
+transforms:
+  Attribute5: log1p      # heavy tail credit amount
 
 pdcal:
   mode: auto            # auto (recommended) | fixed

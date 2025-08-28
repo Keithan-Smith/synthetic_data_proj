@@ -2,15 +2,17 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 
-def plot_histograms(real: pd.DataFrame, synth: pd.DataFrame, cols, path):
+def plot_histograms(df_real, df_syn, cols, out_dir, bins=30):
+    import matplotlib.pyplot as plt
     for c in cols:
-        if c not in real.columns or c not in synth.columns: continue
         plt.figure()
-        real[c].dropna().plot(kind="hist", alpha=0.5, density=True)
-        synth[c].dropna().plot(kind="hist", alpha=0.5, density=True)
+        df_real[c].dropna().plot(kind="hist", bins=bins, density=True, alpha=0.5, label="real")
+        df_syn[c].dropna().plot(kind="hist", bins=bins, density=True, alpha=0.5, label="synth")
         plt.title(f"Histogram: {c}")
         plt.xlabel(c); plt.ylabel("density")
-        plt.savefig(f"{path}/hist_{c}.png"); plt.close()
+        plt.legend()
+        plt.savefig(f"{out_dir}/hist_{c}.png", bbox_inches="tight")
+        plt.close()
 
 def plot_corr(real: pd.DataFrame, synth: pd.DataFrame, cols, path):
     import numpy as np
