@@ -26,7 +26,7 @@ from shocks.spec import ShockSpec
 from eval.fidelity import univariate_fidelity, correlation_diff
 from eval.privacy import membership_inference_auc
 from eval.utility import generic_binary_downstream_eval
-from eval.viz import plot_histograms, plot_corr, plot_pca
+from eval.viz import plot_histograms, plot_pca, plot_corr_compare
 from eval.report import build_report
 
 
@@ -333,13 +333,14 @@ def run(cfg_path: str):
     if getattr(cfg, "task", "none") == "credit_portfolio" and simulate_portfolio is not None:
         panel = simulate_portfolio(
             hybrid_model=hg, originations_df=df,
-            months=getattr(cfg, "months", 18),
-            start_date=getattr(cfg, "start_date", "2019-01-31"),
-            init_customers=getattr(cfg, "init_customers", 100000),
-            base_new=getattr(cfg, "base_new", 120),
+            months=cfg.months, start_date=cfg.start_date,
+            init_customers=cfg.init_customers, base_new=cfg.base_new,
             pd_calibrator=pdcal,
-            pd_logit_shift=getattr(cfg, "pd_logit_shift", 0.0),
-            macro_pd_mult=getattr(cfg, "macro_pd_mult", 1.0)
+            pd_logit_shift=cfg.pd_logit_shift, macro_pd_mult=cfg.macro_pd_mult,
+            lgd_cfg=getattr(cfg, "lgd", None),
+            collateral_cfg=getattr(cfg, "collateral_models", None),
+            purpose_to_asset=getattr(cfg, "purpose_to_asset", None),       # optional; defaults exist
+            mortgage_heuristic=getattr(cfg, "mortgage_heuristic", None),   # optional; defaults to disabled
         )
         panel.to_csv(f"{cfg.output_dir}/panel_synth.csv", index=False)
 
@@ -364,10 +365,20 @@ def run(cfg_path: str):
         if hasattr(hg, 'train_eps_log'): f.write(f"DP eps log: {hg.train_eps_log}\n")
 
     try:
+        # pick numeric cols in common
+        common_numeric = [c for c in df.columns if c in syn_o.columns and pd.api.types.is_numeric_dtype(df[c])]
+        stats_corr = plot_corr_compare(df, syn_o, common_numeric, cfg.output_dir, method="pearson",
+                                    fname_prefix="corr_compare")
+        # write a tiny summary
+        with open(f"{cfg.output_dir}/corr_compare_stats.txt", "w") as f:
+            f.write(str(stats_corr))
+    except Exception as e:
+        with open(f"{cfg.output_dir}/pipeline_warning.txt","a") as f: f.write("\n[corr_compare] "+str(e))
+
+    try:
         viz_top_k = getattr(cfg, "viz_top_k", None)
         cols_to_plot = cont_cols if viz_top_k is None else cont_cols[:viz_top_k]
         plot_histograms(df, syn_o, cols_to_plot, out)
-        plot_corr(df, syn_o, cont_eval[:8], out)
         plot_pca(df, syn_o, cont_eval, out)
         build_report(out)
     except Exception as e:
