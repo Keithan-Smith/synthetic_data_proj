@@ -1,8 +1,34 @@
+"""
+Probability-of-Default (PD) calibration for a tabular dataset.
+
+- Preserves robust behavior from your previous version:
+  * Auto target pick (or pass target_col explicitly)
+  * Binarization of {good/bad, yes/no, true/false, 1/2}
+  * Continuous means cached for imputing at predict time
+  * Categorical 'UNK' fallback + one-hot alignment to training levels
+  * Feature column order preserved; missing cols filled with 0
+  * Base-rate fallback if model unavailable
+
+- Fixes/Improvements:
+  * No 'multi_class' arg (removes sklearn deprecation warnings)
+  * Standardize numerics with StandardScaler
+  * Higher max_iter for better convergence
+  * Class imbalance handled with class_weight="balanced"
+  * Returns monthly hazard h from PD_T via h = -ln(1 - PD_T)/T
+
+Usage:
+    pdcal = PDCalibrator(cont_cols=[...], cat_cols=[...], horizon_months=12)
+    pdcal.fit(df, target_col="bad_within_horizon")
+    pd_m = pdcal.monthly_hazard(book_df)
+"""
+
 import numpy as np
 import pandas as pd
 from typing import List, Optional
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
+from sklearn.exceptions import ConvergenceWarning
+import warnings
 
 _PREFERRED_TARGETS = [
     "bad_within_horizon","default","default_flag","class","label","target"
@@ -46,9 +72,11 @@ class PDCalibrator:
     """
     Fit PD over T months (default 12) and expose monthly hazard via:
       PD_T = 1 - exp(-h T)  =>  h = -ln(1 - PD_T)/T
-    Robust at predict time:
-      - missing continuous -> filled with training mean
-      - missing categoricals -> 'UNK', one-hots aligned to training levels
+
+    Convergence fixes:
+      - Standardize continuous
+      - Try lbfgs, fallback to saga if needed
+      - No deprecated `multi_class` arg
     """
     def __init__(self, cont_cols: Optional[List[str]] = None,
                  cat_cols: Optional[List[str]] = None,
@@ -94,7 +122,7 @@ class PDCalibrator:
         else:
             self.cont_means_ = {}
 
-        # Categorical
+        # Categorical (alignable OHE)
         X_cat = pd.DataFrame(index=df.index)
         if self.cat_cols:
             cat_series = []
@@ -102,7 +130,7 @@ class PDCalibrator:
                 s = _ensure_series(df[c]).astype(str)
                 cat_series.append(s.rename(c))
             X_cat_raw = pd.concat(cat_series, axis=1)
-            X_cat = pd.get_dummies(X_cat_raw, columns=self.cat_cols, drop_first=False)
+            X_cat = pd.get_dummies(X_cat_raw, columns=self.cat_cols, drop_first=True)  # drop_first=True to reduce collinearity
             self.cat_levels = list(X_cat.columns)
         else:
             self.cat_levels = []
@@ -110,7 +138,9 @@ class PDCalibrator:
         # Scale continuous
         if not X_cont.empty:
             self.scaler = StandardScaler(with_mean=True, with_std=True)
-            X_cont = pd.DataFrame(self.scaler.fit_transform(X_cont),
+            X_cont = pd.DataFrame(self.scaler.fit_transform(
+                                  pd.DataFrame({c: pd.to_numeric(X_cont[c], errors="coerce").fillna(self.cont_means_[c])
+                                                for c in self.cont_cols})),
                                   columns=self.cont_cols, index=df.index)
         else:
             self.scaler = None
@@ -118,14 +148,24 @@ class PDCalibrator:
         X = pd.concat([X_cont, X_cat], axis=1)
         self.feature_cols = list(X.columns)
 
-        self.model = LogisticRegression(solver="lbfgs", max_iter=2000, class_weight="balanced")
-        self.model.fit(X, y)
+        # Try lbfgs → saga fallback if needed
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always", category=ConvergenceWarning)
+            self.model = LogisticRegression(solver="lbfgs", penalty="l2",
+                                            class_weight="balanced", max_iter=2000)
+            self.model.fit(X, y)
+            conv_warn = any(isinstance(w.message, ConvergenceWarning) for w in rec)
+
+        if conv_warn:
+            self.model = LogisticRegression(solver="saga", penalty="l2",
+                                            class_weight="balanced", C=0.5, max_iter=8000)
+            self.model.fit(X, y)
 
         self.base_rate = float(np.clip(y.mean(), 1e-6, 1-1e-6))
         return self
 
     def _design(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Continuous with safe fallback
+        # Continuous with safe fallback + scaling
         X_cont = pd.DataFrame(index=df.index)
         if self.cont_cols:
             cont_series = []
@@ -138,13 +178,15 @@ class PDCalibrator:
                     s = pd.Series([mean]*n, index=df.index, name=c)
                 cont_series.append(s.rename(c))
             X_cont_raw = pd.concat(cont_series, axis=1)
+            X_cont_raw = pd.DataFrame({c: pd.to_numeric(X_cont_raw[c], errors="coerce").fillna(self.cont_means_[c])
+                                       for c in self.cont_cols}, index=df.index)
             if self.scaler is not None:
                 X_cont = pd.DataFrame(self.scaler.transform(X_cont_raw),
                                       columns=self.cont_cols, index=df.index)
             else:
                 X_cont = X_cont_raw
 
-        # Categoricals with 'UNK' fallback
+        # Categoricals with 'UNK' fallback, and align to training cols
         X_cat = pd.DataFrame(index=df.index)
         if self.cat_cols:
             cat_series = []
@@ -156,7 +198,7 @@ class PDCalibrator:
                     s = pd.Series(["UNK"]*n, index=df.index, name=c)
                 cat_series.append(s.rename(c))
             X_cat_raw = pd.concat(cat_series, axis=1)
-            X_cat = pd.get_dummies(X_cat_raw, columns=self.cat_cols, drop_first=False)
+            X_cat = pd.get_dummies(X_cat_raw, columns=self.cat_cols, drop_first=True)
             for c in self.cat_levels:
                 if c not in X_cat.columns:
                     X_cat[c] = 0
