@@ -14,6 +14,23 @@ from data.schemas import Schema, forward_transform, inverse_transform
 from shocks.spec import ShockSpec
 from shocks.apply import build_corr_override, apply_cont_marginal_shocks
 from privacy.dp import DPConfig, clip_and_noise_, rough_rdp_epsilon
+from privacy.regularizer import PrivacyUtilityRegularizer, PrivacyRegConfig  # (kept for compatibility)
+
+# ---------------- small type helpers (robust to YAML strings) ----------------
+def _as_bool(x):
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, float)):
+        return bool(x)
+    if isinstance(x, str):
+        return x.strip().lower() in ("1", "true", "yes", "y", "on")
+    return False
+
+def _as_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
 
 # ---------------- AMP compatibility helpers ----------------
 def _make_scaler(cuda_enabled: bool):
@@ -69,6 +86,36 @@ def _autocast_ctx(cuda_enabled: bool):
                 return nullcontext()
         return nullcontext()
 
+# ---------------- simple RBF-MMD regularizer ----------------
+def _rbf_mmd2(x: torch.Tensor, y: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
+    """
+    Unbiased squared MMD with RBF kernel between batches x and y.
+    x, y: [B, D] (grad flows through x; y can be detached)
+    """
+    x = x.float()
+    y = y.float()
+    bx = x.size(0)
+    by = y.size(0)
+    if bx < 2 or by < 2:
+        return x.new_tensor(0.0)
+
+    def _rbf(a, b):
+        aa = (a * a).sum(dim=1, keepdim=True)
+        bb = (b * b).sum(dim=1, keepdim=True)
+        ab = a @ b.t()
+        dist2 = aa - 2 * ab + bb.t()
+        return torch.exp(-dist2 / (2.0 * (sigma ** 2)))
+
+    Kxx = _rbf(x, x)
+    Kyy = _rbf(y, y)
+    Kxy = _rbf(x, y)
+
+    # Unbiased: remove diagonal terms for Kxx/Kyy
+    Kxx = (Kxx.sum() - Kxx.diag().sum()) / (bx * (bx - 1))
+    Kyy = (Kyy.sum() - Kyy.diag().sum()) / (by * (by - 1))
+    Kxy = Kxy.mean()
+    return Kxx + Kyy - 2.0 * Kxy
+
 # ---------------- Hybrid model ----------------
 class HybridGenerator:
     def __init__(self, cont_cols, cat_cols, schema: Schema = None, device='cuda'):
@@ -83,9 +130,14 @@ class HybridGenerator:
         self.gan_D = None
         self.cat_ar = CategoricalAR(cat_cols=cat_cols, cont_cols=cont_cols)
         self.train_eps_log = {}
+        self.train_logs = {}            # scalar logs (e.g., mean MMDs)
+        self.priv_cfg = None
+        self.priv_reg = None
+        self.holdout_idx = None
+        self._cont_stats = None
 
     def fit(self, df: pd.DataFrame, epochs_vae=20, epochs_gan=100, batch=256,
-            privacy_cfg: dict = None, mine_cfg: dict = None):
+            privacy_cfg: dict = None, mine_cfg: dict = None, privacy_reg_cfg: dict | None = None):
         df_fit = df[self.cont_cols + self.cat_cols].dropna().reset_index(drop=True)
 
         # Work in transformed continuous space if schema provided
@@ -93,6 +145,10 @@ class HybridGenerator:
             df_fit_cont = forward_transform(df_fit[self.cont_cols], self.schema)
         else:
             df_fit_cont = df_fit[self.cont_cols].copy()
+        
+        mu = df_fit_cont.mean(axis=0)
+        sd = df_fit_cont.std(axis=0).replace(0.0, 1.0)
+        self._cont_stats = {c: (float(mu[c]), float(sd[c])) for c in self.cont_cols}
 
         # 1) Copula
         self.copula.fit(df_fit_cont)
@@ -109,28 +165,64 @@ class HybridGenerator:
             torch.backends.cudnn.benchmark = True
         scaler = _make_scaler(cuda_on)
 
+        # --- DP config (optional, robust to YAML strings) ---
         dp = None
-        if privacy_cfg and privacy_cfg.get("enabled", False):
-            dp = DPConfig(max_grad_norm=privacy_cfg.get("dp_max_grad_norm",1.0),
-                          noise_multiplier=privacy_cfg.get("dp_noise_multiplier",0.0),
-                          sample_rate=min(1.0, batch/max(1,Xc.shape[0])),
-                          delta=privacy_cfg.get("dp_delta",1e-5))
+        priv_cfg = privacy_cfg or {}
+        if _as_bool(priv_cfg.get("enabled", False)):
+            dp = DPConfig(
+                max_grad_norm=_as_float(priv_cfg.get("dp_max_grad_norm", 1.0), 1.0),
+                noise_multiplier=_as_float(priv_cfg.get("dp_noise_multiplier", 0.0), 0.0),
+                sample_rate=float(min(1.0, batch / max(1, Xc.shape[0]))),
+                delta=_as_float(priv_cfg.get("dp_delta", 1e-5), 1e-5),
+            )
+
+        # --- Privacy–utility regularizer config (optional) ---
+        reg = privacy_reg_cfg or {}
+        reg_enabled = _as_bool(reg.get("enabled", False))
+        reg_mode = str(reg.get("mode", "attractive")).lower()          # 'attractive' or 'repulsive'
+        reg_sigma = _as_float(reg.get("mmd_bandwidth", 1.0), 1.0)
+        reg_lam_g = _as_float(reg.get("lambda_mmd_gan", reg.get("lambda_mmd", 0.0)), 0.0)
+        reg_lam_v = _as_float(reg.get("lambda_mmd_vae", max(0.0, 0.25 * reg_lam_g)), 0.0)
+
+        self.priv_cfg = privacy_cfg
+        self.priv_reg = reg
+
+        # --- VAE training ---
         steps = 0
+        mmd_vae_sum, mmd_vae_cnt = 0.0, 0
         for _ in range(epochs_vae):
             for (xb,) in loader:
                 xb = xb.to(self.device, non_blocking=True)
                 with _autocast_ctx(cuda_on):
                     recon, mu, logvar = self.vae(xb)
                     loss, _ = TabularVAE.loss_fn(recon, xb, mu, logvar)
+
+                    # Mild MMD on recon vs input to help dispersion (utility-leaning)
+                    if reg_enabled and reg_lam_v > 0.0:
+                        mmd_v = _rbf_mmd2(recon, xb.detach(), sigma=reg_sigma)
+                        loss = loss + reg_lam_v * mmd_v
+                    else:
+                        mmd_v = None
+
                 opt.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 if dp:
                     scaler.unscale_(opt); clip_and_noise_(self.vae, dp)
                 scaler.step(opt); scaler.update(); steps += 1
+
+                if mmd_v is not None and torch.isfinite(mmd_v):
+                    mmd_vae_sum += float(mmd_v.detach().cpu())
+                    mmd_vae_cnt += 1
+
         if dp:
-            self.train_eps_log['vae_eps'] = rough_rdp_epsilon(
-                dp.noise_multiplier, steps, dp.sample_rate, dp.delta
-            )
+            if dp.noise_multiplier > 0:
+                self.train_eps_log['vae_eps'] = rough_rdp_epsilon(
+                    dp.noise_multiplier, steps, dp.sample_rate, dp.delta
+                )
+            else:
+                self.train_eps_log['vae_eps'] = float("inf")
+        if mmd_vae_cnt > 0:
+            self.train_logs['mmd_vae_mean'] = mmd_vae_sum / mmd_vae_cnt
 
         # 3) Categorical AR
         self.cat_ar.fit(df_fit)
@@ -140,11 +232,11 @@ class HybridGenerator:
             recon, _, _ = self.vae(Xc.to(self.device))
         resid = (Xc.to(self.device) - recon).cpu().numpy()
         R = torch.tensor(resid, dtype=torch.float32)
-        z_dim = min(32, R.shape[1]*2)
+        z_dim = min(32, R.shape[1] * 2)
         self.gan_G = Generator(z_dim=z_dim, x_dim=R.shape[1]).to(self.device)
         self.gan_D = Critic(x_dim=R.shape[1]).to(self.device)
-        g_opt = torch.optim.Adam(self.gan_G.parameters(), lr=1e-4, betas=(0.5,0.9))
-        d_opt = torch.optim.Adam(self.gan_D.parameters(), lr=1e-4, betas=(0.5,0.9))
+        g_opt = torch.optim.Adam(self.gan_G.parameters(), lr=1e-4, betas=(0.5, 0.9))
+        d_opt = torch.optim.Adam(self.gan_D.parameters(), lr=1e-4, betas=(0.5, 0.9))
         data_loader = DataLoader(TensorDataset(R), batch_size=128, shuffle=True,
                                  pin_memory=cuda_on, num_workers=2)
         lambda_gp = 10.0
@@ -152,9 +244,11 @@ class HybridGenerator:
         g_scaler = _make_scaler(cuda_on)
         d_scaler = _make_scaler(cuda_on)
 
+        mmd_g_sum, mmd_g_cnt = 0.0, 0
         for _ in range(epochs_gan):
             for (rb,) in data_loader:
                 rb = rb.to(self.device, non_blocking=True)
+
                 # Critic
                 z = torch.randn(rb.size(0), z_dim, device=self.device)
                 with _autocast_ctx(cuda_on):
@@ -162,7 +256,7 @@ class HybridGenerator:
                     d_real = self.gan_D(rb)
                     d_fake = self.gan_D(fake.detach())
                     gp = gradient_penalty(self.gan_D, rb, fake.detach())
-                    d_loss = -(d_real.mean() - d_fake.mean()) + lambda_gp*gp
+                    d_loss = -(d_real.mean() - d_fake.mean()) + lambda_gp * gp
                 d_opt.zero_grad(set_to_none=True)
                 d_scaler.scale(d_loss).backward()
                 if dp:
@@ -174,15 +268,37 @@ class HybridGenerator:
                 with _autocast_ctx(cuda_on):
                     fake = self.gan_G(z)
                     g_loss = -self.gan_D(fake).mean()
+
+                    # Privacy–utility MMD on residuals
+                    if reg_enabled and reg_lam_g > 0.0:
+                        mmd_g = _rbf_mmd2(fake, rb.detach(), sigma=reg_sigma)
+                        if reg_mode == "repulsive":
+                            g_loss = g_loss - reg_lam_g * mmd_g   # privacy-leaning
+                        else:
+                            g_loss = g_loss + reg_lam_g * mmd_g   # utility-leaning
+                    else:
+                        mmd_g = None
+
                 g_opt.zero_grad(set_to_none=True)
                 g_scaler.scale(g_loss).backward()
                 if dp:
                     g_scaler.unscale_(g_opt); clip_and_noise_(self.gan_G, dp)
                 g_scaler.step(g_opt); g_scaler.update(); steps += 1
+
+                if mmd_g is not None and torch.isfinite(mmd_g):
+                    mmd_g_sum += float(mmd_g.detach().cpu())
+                    mmd_g_cnt += 1
+
         if dp:
-            self.train_eps_log['gan_eps'] = rough_rdp_epsilon(
-                dp.noise_multiplier, steps, min(1.0, 128/max(1,R.shape[0])), dp.delta
-            )
+            if dp.noise_multiplier > 0:
+                self.train_eps_log['gan_eps'] = rough_rdp_epsilon(
+                    dp.noise_multiplier, steps, min(1.0, 128 / max(1, R.shape[0])), dp.delta
+                )
+            else:
+                self.train_eps_log['gan_eps'] = float("inf")
+        if mmd_g_cnt > 0:
+            self.train_logs['mmd_gan_mean'] = mmd_g_sum / mmd_g_cnt
+
         return self
 
     # ---------- shocks-aware sampling ----------
@@ -209,13 +325,17 @@ class HybridGenerator:
             X = (recon + resid).cpu().numpy()
         cont_syn = pd.DataFrame(X, columns=self.cont_cols)
 
-        # 5) categoricals with optional logit bias
-        # If your CategoricalAR.sample ignores logit_bias, it will just be a no-op.
+        # 5) categoricals with optional logit bias (no-op if AR ignores it)
         cat_syn = self.cat_ar.sample(n, cont_syn, logit_bias=spec.cat_logit_bias)
 
         out = pd.concat([cont_syn, cat_syn], axis=1)
 
         # 6) invert transforms back to original scale at the very end
+        if self._cont_stats is not None:
+            k = 8.0
+            for c in self.cont_cols:
+                m, s = self._cont_stats[c]
+                cont[c] = cont[c].clip(m - k*s, m + k*s)
         if self.schema:
             out[self.cont_cols] = inverse_transform(out[self.cont_cols], self.schema)
         return out

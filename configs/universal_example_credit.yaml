@@ -4,9 +4,24 @@ adapter: "universal"
 data_source: "ucimlrepo"
 uci_id: 144
 
-# Optional remap/aliases (comment out if not present)
-# column_map: "configs/column_map_credit.yaml"
-# domain_pack: "data/aliases/credit.yaml"
+# Canonical names + human-readable value aliases
+# NOTE: these paths are RELATIVE TO THIS YAML'S FOLDER (do NOT prefix with 'configs/')
+column_map: "column_map_credit.yaml"
+domain_pack: "alias_pack_credit.yaml"
+
+# Simulator mapping used in credit_portfolio task
+purpose_to_asset:
+  "car (new)": vehicle
+  "car (used)": vehicle
+  "furniture/equipment": unsecured
+  "radio/TV": unsecured
+  "domestic appliances": unsecured
+  "repairs": unsecured
+  "education": unsecured
+  "vacation": unsecured
+  "retraining": unsecured
+  "business": business
+  "other": unsecured
 
 output_dir: "outputs/credit_run"
 seed: 242
@@ -20,54 +35,66 @@ base_new: 120
 
 training_profile: thorough
 
-privacy_enabled: false
+# ---------------- Differential Privacy ----------------
+privacy_enabled: true
 dp_max_grad_norm: 1.0
-dp_noise_multiplier: 0.0
+dp_noise_multiplier: 0.6     # tune to hit desired ε (logged in summary.txt)
 dp_delta: 1e-5
 
-# Treat small-cardinality ints as categorical; set columns explicitly for German
-cont_cols: ["Attribute2","Attribute5","Attribute13"]             # Duration, Credit amount, Age
-cat_cols:  ["Attribute1","Attribute3","Attribute4","Attribute6",
-            "Attribute7","Attribute8","Attribute9","Attribute10",
-            "Attribute11","Attribute12","Attribute14","Attribute15",
-            "Attribute16","Attribute17","Attribute19","Attribute20"]
+# -------- Privacy–Utility Regularizer (MMD) ----------
+privreg_enabled: true
+privreg_mode: "repulsive"    # 'repulsive' = privacy-leaning, 'attractive' = utility-leaning
+privreg_lambda_gan: 1.0      # try 0.5–2.0
+privreg_lambda_vae: 0.25     # ~25% of GAN weight
+privreg_mmd_bandwidth: 1.0
 
-# Per-column transforms (handled by your schema utils)
+# --------------- Baselines / Ablations ---------------
+run_baselines: true          # writes outputs/.../baselines/no_privreg
+
+# --------- Visual dispersion helper (plots only) -----
+disperse_quantiles: true
+
+# Feature lists (German Credit)
+cont_cols: ["loan_term_months","loan_amount","age"]
+cat_cols:
+  ["checking_status","credit_history","purpose","savings","employment_since",
+   "installment_rate_pct","personal_status_sex","other_debtors","residence_since",
+   "property","other_installment_plans","housing","existing_credits",
+   "job","telephone","foreign_worker"]
+
+# Per-column transforms
 transforms:
-  Attribute5: log1p      # heavy tail credit amount
+  loan_amount: log1p
 
 pdcal:
-  mode: auto            # auto (recommended) | fixed
-  horizon_months: 12    # PD horizon -> simulator converts to monthly hazard
-  max_cont: 8           # max numeric features to use (auto mode)
-  max_cat: 8            # max categorical features to use (auto mode)
-  max_cat_levels: 30    # drop cats with too many levels (avoids huge one-hots)
-  include: []           # optional regexes to force-include (e.g., ["^age$", "^income$"])
-  exclude: ["^id$", "^index$", "^name$"]  # regexes to exclude junk cols
-  
-shock_enabled: false
+  mode: auto
+  horizon_months: 12
+  max_cont: 8
+  max_cat: 8
+  max_cat_levels: 30
+  include: []
+  exclude: ["^id$", "^index$", "^name$"]
 
-# >>> SHOCKS <<<
+# --- Privacy/Utility sweep ---
+sweep:
+  enabled: true
+
+  # Choose which axis/axes to sweep. You can enable either or both.
+  dp_noise_list: [0.0, 0.3, 0.6, 0.9]          # varies dp_noise_multiplier (turns DP on)
+  mmd_lambda_gan_list: [0.0, 0.25, 0.5, 1.0]   # varies privreg_lambda_gan
+  mmd_mode: "repulsive"                        # 'repulsive' (privacy-leaning) | 'attractive'
+  mmd_lambda_vae_factor: 0.25                  # VAE weight as a fraction of GAN weight
+
+  # Whether to do the full cartesian product (grid) when both lists provided
+  grid: false                                  # false = run each sweep separately
+
+
+# -------- Shocks OFF (keep here but disabled) --------
+shock_enabled: false
 shock:
   corr_shrink: 0.25
-  # either list of triples:
-  corr_pairs:
-    - [income, loan_amount, 0.6]
-    - [age, loan_amount, -0.2]
-  # or as a dict with string keys "(col_i,col_j)": rho
-  # corr_pairs:
-  #   "(income,loan_amount)": 0.6
-
-  cont_mu_shift:
-    income: 1000
-
-  cont_scale:
-    loan_amount: 1.1
-
-  residual_scale: 1.2
-
-  # categorical biases: use your category VALUES (e.g., German A-codes)
-  cat_logit_bias:
-    purpose:
-      A40: 0.5     # tilt towards "car (new)"
-      A45: -0.2    # tilt away from "repairs"
+  corr_pairs: []
+  cont_mu_shift: {}
+  cont_scale: {}
+  residual_scale: 1.0
+  cat_logit_bias: {}
