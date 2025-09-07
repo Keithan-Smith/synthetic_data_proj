@@ -7,7 +7,7 @@ targets:
     - class
     - creditability
 
-enum_map:
+fields:
   loan_amount: [loan_amount, credit_amount, amount, exposure_at_origination, balance_at_orig]
   loan_term: [loan_term, term, duration, duration_months]
   interest_rate: [interest_rate, rate, ap                                                  r, coupon]
