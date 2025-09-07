@@ -1,7 +1,6 @@
-# Map CSV columns to canonical names used by the pipeline.
 map:
   Attribute1:  checking_status
-  Attribute2:  loan_term_months
+  Attribute2:  loan_term
   Attribute3:  credit_history
   Attribute4:  purpose
   Attribute5:  loan_amount
@@ -21,3 +20,4 @@ map:
   Attribute19: telephone
   Attribute20: foreign_worker
   class:       bad_within_horizon   # 1/2 → 0/1 mapping happens in loader
+

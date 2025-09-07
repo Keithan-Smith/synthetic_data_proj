@@ -4,10 +4,9 @@ adapter: "universal"
 data_source: "ucimlrepo"
 uci_id: 144
 
-# Canonical names + human-readable value aliases
-# NOTE: these paths are RELATIVE TO THIS YAML'S FOLDER (do NOT prefix with 'configs/')
-column_map: "column_map_credit.yaml"
-domain_pack: "alias_pack_credit.yaml"
+# Paths are relative to this YAML
+column_map: "column_map_credit.yaml"  
+domain_pack: "alias_pack_credit.yaml"    
 
 # Simulator mapping used in credit_portfolio task
 purpose_to_asset:
@@ -35,37 +34,36 @@ base_new: 120
 
 training_profile: thorough
 
-# ---------------- Differential Privacy ----------------
+# === Privacy (formal DP) ===
 privacy_enabled: true
 dp_max_grad_norm: 1.0
-dp_noise_multiplier: 0.6     # tune to hit desired ε (logged in summary.txt)
+dp_noise_multiplier: 0.6
 dp_delta: 1e-5
 
-# -------- Privacy–Utility Regularizer (MMD) ----------
+# === Privacy–Utility Regularizer (MMD) ===
 privreg_enabled: true
-privreg_mode: "repulsive"    # 'repulsive' = privacy-leaning, 'attractive' = utility-leaning
-privreg_lambda_gan: 1.0      # try 0.5–2.0
-privreg_lambda_vae: 0.25     # ~25% of GAN weight
+privreg_mode: "repulsive"         # privacy-leaning
+privreg_lambda_gan: 1.0
+privreg_lambda_vae: 0.25
 privreg_mmd_bandwidth: 1.0
 
-# --------------- Baselines / Ablations ---------------
-run_baselines: true          # writes outputs/.../baselines/no_privreg
+# === Baselines / Ablations ===
+run_baselines: true               # writes outputs/.../baselines/no_privreg
 
-# --------- Visual dispersion helper (plots only) -----
+# === Visual dispersion helper (plots only) ===
 disperse_quantiles: true
 
-# Feature lists (German Credit)
-cont_cols: ["loan_term_months","loan_amount","age"]
+# === Feature lists (German Credit) ===
+# Standardize naming: use "loan_term" (months)
+cont_cols: ["loan_term","loan_amount","age"]
 cat_cols:
   ["checking_status","credit_history","purpose","savings","employment_since",
    "installment_rate_pct","personal_status_sex","other_debtors","residence_since",
    "property","other_installment_plans","housing","existing_credits",
    "job","telephone","foreign_worker"]
 
-# Per-column transforms
-transforms:
-  loan_amount: log1p
 
+# === PD calibration (real-data driven) ===
 pdcal:
   mode: auto
   horizon_months: 12
@@ -75,21 +73,19 @@ pdcal:
   include: []
   exclude: ["^id$", "^index$", "^name$"]
 
-# --- Privacy/Utility sweep ---
+# Target average PD used when we calibrate panel PDs
+pd_target_rate: 0.02
+
+# === Privacy/Utility sweep ===
 sweep:
   enabled: true
+  dp_noise_list: [0.0, 0.3, 0.6, 0.9]
+  mmd_lambda_gan_list: [0.0, 0.25, 0.5, 1.0]
+  mmd_mode: "repulsive"
+  mmd_lambda_vae_factor: 0.25
+  grid: false
 
-  # Choose which axis/axes to sweep. You can enable either or both.
-  dp_noise_list: [0.0, 0.3, 0.6, 0.9]          # varies dp_noise_multiplier (turns DP on)
-  mmd_lambda_gan_list: [0.0, 0.25, 0.5, 1.0]   # varies privreg_lambda_gan
-  mmd_mode: "repulsive"                        # 'repulsive' (privacy-leaning) | 'attractive'
-  mmd_lambda_vae_factor: 0.25                  # VAE weight as a fraction of GAN weight
-
-  # Whether to do the full cartesian product (grid) when both lists provided
-  grid: false                                  # false = run each sweep separately
-
-
-# -------- Shocks OFF (keep here but disabled) --------
+# === Shocks OFF (keep spec but disabled) ===
 shock_enabled: false
 shock:
   corr_shrink: 0.25
@@ -98,3 +94,6 @@ shock:
   cont_scale: {}
   residual_scale: 1.0
   cat_logit_bias: {}
+
+# Optional eval quality-of-life
+viz_top_k: 12

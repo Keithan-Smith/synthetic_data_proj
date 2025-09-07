@@ -1,4 +1,41 @@
-# Human-friendly value aliases for German Credit categorical codes
+targets:
+  bad_within_horizon:
+    - bad
+    - default
+    - default_flag
+    - label
+    - class
+    - creditability
+    - target
+
+fields:
+  loan_amount: [loan_amount, credit_amount, amount, exposure_at_origination, balance_at_orig]
+  loan_term: [loan_term, term, duration, duration_months, loan_term_months]
+  interest_rate: [interest_rate, rate, apr, coupon]
+  income: [income, annual_income, salary, household_income]
+  age: [age, age_years]
+  number_of_dependents: [dependents, num_dependents, number_of_dependents]
+  residence_since: [residence_since, yrs_at_residence, years_at_residence]
+  existing_credits: [existing_credits, num_existing_credits, open_loans]
+  installment_rate_pct: [installment_rate_pct, installment_pct, inst_pct, installment_rate]
+  loan_balance: [loan_balance, balance, principal_outstanding, eop_balance]
+  loan_origination_date: [loan_origination_date, orig_date, origination_date, funded_date, start_date]
+  customer_id: [customer_id, account_id, loan_id, id]
+  name: [name, customer_name, borrower_name]
+  checking_status: [checking_status, status_of_existing_checking_account]
+  credit_history: [credit_history]
+  purpose: [purpose]
+  savings: [savings, savings_account, savings_account_bonds]
+  employment_since: [employment_since, present_employment_since]
+  other_debtors: [other_debtors, guarantors, coapplicant]
+  property: [property]
+  other_installment_plans: [other_installment_plans]
+  housing: [housing]
+  job: [job]
+  telephone: [telephone]
+  foreign_worker: [foreign_worker]
+
+# Map categorical codes -> human-readable labels (used in normalize_df)
 enum_map:
   checking_status:            # Attribute1
     A11: "< 0 DM"
@@ -11,7 +48,7 @@ enum_map:
     A32: "paid till now"
     A33: "delay in past"
     A34: "critical/other existing"
-  purpose:                     # Attribute4
+  purpose:                    # Attribute4
     A40: "car (new)"
     A41: "car (used)"
     A42: "furniture/equipment"
@@ -23,49 +60,49 @@ enum_map:
     A48: "retraining"
     A49: "business"
     A410: "other"
-  savings:                     # Attribute6
+  savings:                    # Attribute6
     A61: "< 100 DM"
     A62: "100-500 DM"
     A63: "500-1000 DM"
     A64: ">= 1000 DM"
     A65: "unknown/no savings"
-  employment_since:            # Attribute7
+  employment_since:           # Attribute7
     A71: "unemployed"
     A72: "< 1 yr"
     A73: "1-4 yrs"
     A74: "4-7 yrs"
     A75: ">= 7 yrs"
-  personal_status_sex:         # Attribute9
+  personal_status_sex:        # Attribute9
     A91: "male: divorced/sep"
     A92: "female: div/sep/married"
     A93: "male: single"
     A94: "male: married/widowed"
     A95: "female: single"
-  other_debtors:               # Attribute10
+  other_debtors:              # Attribute10
     A101: "none"
     A102: "co-applicant"
     A103: "guarantor"
-  property:                    # Attribute12
+  property:                   # Attribute12
     A121: "real estate"
     A122: "bldg society/life ins."
     A123: "car/other"
     A124: "unknown/no property"
-  other_installment_plans:     # Attribute14
+  other_installment_plans:    # Attribute14
     A141: "bank"
     A142: "stores"
     A143: "none"
-  housing:                     # Attribute15
+  housing:                    # Attribute15
     A151: "rent"
     A152: "own"
     A153: "for free"
-  job:                         # Attribute17
+  job:                        # Attribute17
     A171: "unemployed/unskilled-nr"
     A172: "unskilled-resident"
     A173: "skilled employee/official"
     A174: "management/self-employed"
-  telephone:                   # Attribute19
+  telephone:                  # Attribute19
     A191: "none"
     A192: "yes, registered"
-  foreign_worker:              # Attribute20
+  foreign_worker:             # Attribute20
     A201: "yes"
     A202: "no"
