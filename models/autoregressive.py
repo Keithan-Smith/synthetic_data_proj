@@ -150,7 +150,7 @@ class CategoricalAR:
         # First attempt: lbfgs
         with warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always", category=ConvergenceWarning)
-            lr = LogisticRegression(solver="lbfgs", penalty="l2", C=1.0, max_iter=4000)
+            lr = LogisticRegression(solver="lbfgs", penalty="l2", C=1.0, max_iter=4000, multi_class="multinomial", class_weight="balanced")
             lr.fit(X, y)
             conv_warn = any(isinstance(w.message, ConvergenceWarning) for w in rec)
 
@@ -158,7 +158,10 @@ class CategoricalAR:
             return lr
 
         # Fallback: saga (handles large sparse-ish OHEs better), more iters, stronger reg
-        lr2 = LogisticRegression(solver="saga", penalty="l2", C=0.5, max_iter=8000)
+        lr2 = LogisticRegression(
+        solver="saga", penalty="l2", C=0.5, max_iter=8000,
+            multi_class="multinomial", class_weight="balanced"
+            )
         lr2.fit(X, y)
         return lr2
 

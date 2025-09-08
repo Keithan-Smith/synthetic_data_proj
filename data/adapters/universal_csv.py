@@ -37,20 +37,17 @@ def _rename_with_aliases(df: pd.DataFrame, alias_pack: dict) -> pd.DataFrame:
     return df
 
 def _apply_enum_map(df: pd.DataFrame, enum_map: Dict[str, Dict[str, str]]) -> pd.DataFrame:
-    """
-    Map categorical codes -> readable labels, e.g.
-      enum_map:
-        purpose:
-          A40: car_new
-          A41: car_used
-        housing:
-          A152: own
-    Unknown codes pass through unchanged.
-    """
     for col, mapping in (enum_map or {}).items():
         if col in df.columns:
-            s = df[col].astype(str)
-            df[col] = s.map(mapping).fillna(df[col])
+            s = df[col].astype(str).str.strip()
+            # normalize keys
+            m = {str(k).strip(): v for k, v in (mapping or {}).items()}
+            m.update({str(k).strip().lower(): v for k, v in (mapping or {}).items()})
+            mapped = s.map(m)
+            mask = mapped.isna()
+            mapped.loc[mask] = s.loc[mask].str.lower().map(m)
+            mapped = mapped.fillna(df[col])
+            df[col] = pd.Categorical(mapped)
     return df
 
 def _maybe_parse_dates(df: pd.DataFrame):
@@ -67,33 +64,52 @@ def normalize_df(df: pd.DataFrame,
                  column_map_path: Optional[str] = None,
                  alias_pack_path: Optional[str] = None,
                  parse_dates: bool = True) -> pd.DataFrame:
-    # optional flat column map (explicit rename)
+    # 1) optional flat column map (explicit rename)
     if column_map_path:
         cm_yaml = _load_yaml(column_map_path)
         if isinstance(cm_yaml, dict) and "map" in cm_yaml:
             df = _apply_column_map(df, cm_yaml["map"])
 
+    # 2) alias pack: field/target renames + enum mapping + target normalization
     alias_pack = None
     if alias_pack_path:
         alias_pack = _load_yaml(alias_pack_path)
         if isinstance(alias_pack, dict):
+            # (a) rename columns by aliases (fields + targets)
             df = _rename_with_aliases(df, alias_pack)
 
-            # NEW: categorical code -> label mapping
+            # (b) categorical code -> human label mapping
             if "enum_map" in alias_pack and isinstance(alias_pack["enum_map"], dict):
                 df = _apply_enum_map(df, alias_pack["enum_map"])
 
-            # normalize common stringy/binary targets to 0/1
+            # (c) normalize common binary targets to {0,1}
             for t in (alias_pack.get("targets") or {}).keys():
-                if t in df.columns and df[t].dtype == object:
-                    sl = df[t].astype(str).str.lower()
-                    if sl.isin(["good", "bad"]).any():
-                        df[t] = (sl == "bad").astype(int)
-                    elif sl.isin(["yes", "no"]).any():
-                        df[t] = (sl == "yes").astype(int)
-                    elif sl.isin(["true", "false"]).any():
-                        df[t] = (sl == "true").astype(int)
+                if t in df.columns:
+                    s = df[t]
 
+                    # string targets
+                    if s.dtype == object:
+                        sl = s.astype(str).str.strip().str.lower()
+                        u = set(sl.dropna().unique())
+                        if u <= {"good", "bad"}:
+                            df[t] = (sl == "bad").astype("Int8")
+                            continue
+                        if u <= {"yes", "no"}:
+                            df[t] = (sl == "yes").astype("Int8")
+                            continue
+                        if u <= {"true", "false"}:
+                            df[t] = (sl == "true").astype("Int8")
+                            continue
+
+                    # numeric {1,2} → {0,1}; keep {0,1} as-is; preserve NA with nullable ints
+                    s_num = pd.to_numeric(s, errors="coerce")
+                    vals = set(pd.unique(s_num.dropna()))
+                    if vals <= {1, 2}:
+                        df[t] = s_num.map({1: 0, 2: 1}).astype("Int8")
+                    elif vals <= {0, 1}:
+                        df[t] = s_num.astype("Int8")
+
+    # 3) auto-parse date-like columns
     if parse_dates:
         df = _maybe_parse_dates(df)
 
@@ -103,6 +119,6 @@ def load_any_csv(path: str, column_map_path: Optional[str] = None,
                  alias_pack_path: Optional[str] = None,
                  parse_dates: bool = True,
                  read_csv_kwargs: Optional[dict] = None) -> pd.DataFrame:
-    read_csv_kwargs = read_csv_kwargs or {}
+    read_csv_kwargs = {"low_memory": False, **(read_csv_kwargs or {})}
     df = pd.read_csv(path, **read_csv_kwargs)
     return normalize_df(df, column_map_path, alias_pack_path, parse_dates)

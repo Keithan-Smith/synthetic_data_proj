@@ -19,12 +19,20 @@ class GaussianCopula:
         np.fill_diagonal(C, 1.0)
         return C
 
-    def fit(self, X_df: pd.DataFrame):
+    def fit(self, X_df: pd.DataFrame, shrinkage: Optional[str] = "lw"):
         if self.cols is None:
             self.cols = list(X_df.columns)
         X = X_df[self.cols].to_numpy(dtype=float, copy=True)
         self.mean = X.mean(axis=0)
-        cov = np.cov(X, rowvar=False)
+        if shrinkage == "lw":
+            try:
+                from sklearn.covariance import LedoitWolf
+                cov = LedoitWolf().fit(X).covariance_
+            except Exception:
+                cov = np.cov(X, rowvar=False)
+        else:
+            cov = np.cov(X, rowvar=False)
+
         cov = (cov + cov.T) / 2.0
         eig = np.linalg.eigvalsh(cov)
         if np.any(eig <= 0):

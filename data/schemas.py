@@ -34,6 +34,33 @@ def _sigmoid_stable(x):
     # clip away from exact 0/1 for numerical safety
     return np.clip(out, 1e-8, 1 - 1e-8)
 
+def _fit_rankgauss_quantiles(s: pd.Series, ngrid: int = 2001) -> np.ndarray:
+    v = pd.to_numeric(s, errors="coerce").dropna().values
+    if len(v) < 10:
+        # fallback grid to keep invertible behavior
+        return np.linspace(np.nanmin(v) if len(v) else -1.0, np.nanmax(v) if len(v) else 1.0, ngrid)
+    return np.quantile(v, np.linspace(0, 1, ngrid))
+
+def _rank_to_norm(u: np.ndarray) -> np.ndarray:
+    # map u in (0,1) to N(0,1) via inverse error function
+    u = np.clip(u, 1e-8, 1-1e-8)
+    return np.sqrt(2.0) * np.erfinv(2*u - 1.0)
+
+def _norm_to_rank(z: np.ndarray) -> np.ndarray:
+    return 0.5 * (1.0 + np.erf(z / np.sqrt(2.0)))
+
+def _rankgauss_forward(x: np.ndarray, qgrid: np.ndarray) -> np.ndarray:
+    # empirical CDF via quantile grid
+    idx = np.searchsorted(qgrid, x, side="left")
+    u = idx / max(len(qgrid) - 1, 1)
+    return _rank_to_norm(u)
+
+def _rankgauss_inverse(z: np.ndarray, qgrid: np.ndarray) -> np.ndarray:
+    u = _norm_to_rank(z)
+    idx = (u * (len(qgrid) - 1)).astype(int)
+    idx = np.clip(idx, 0, len(qgrid) - 1)
+    return qgrid[idx]
+
 # ---------------- schema dataclasses ----------------
 @dataclass
 class TypeSpec:
@@ -41,6 +68,7 @@ class TypeSpec:
     link: str = ""
     min_val: Optional[float] = None
     max_val: Optional[float] = None
+    params: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class Schema:
@@ -94,32 +122,53 @@ LINKS: Dict[str, Tuple] = {
 def forward_transform(df: pd.DataFrame, schema: Schema) -> pd.DataFrame:
     out = df.copy()
     for c, spec in schema.continuous.items():
-        if c in out.columns:
-            f, _ = LINKS.get(spec.link, LINKS[""])
-            # operate on numpy array for speed; preserve index on assignment
-            arr = out[c].to_numpy()
+        if c not in out.columns:
+            continue
+        arr = pd.to_numeric(out[c], errors="coerce").to_numpy()
+        link = (spec.link or "").lower()
+
+        if link == "rankgauss":
+            # fit grid once per column and cache in spec.params
+            if "qgrid" not in spec.params or spec.params.get("qgrid") is None:
+                spec.params["qgrid"] = _fit_rankgauss_quantiles(out[c])
+            out[c] = _rankgauss_forward(arr, spec.params["qgrid"])
+        else:
+            f, _ = LINKS.get(link, LINKS[""])
             out[c] = f(arr)
     return out
 
 def inverse_transform(df: pd.DataFrame, schema: Schema) -> pd.DataFrame:
     out = df.copy()
     for c, spec in schema.continuous.items():
-        if c in out.columns:
-            _, inv = LINKS.get(spec.link, LINKS[""])
-            arr = out[c].to_numpy()
-            arr = inv(arr)  # overflow-safe inverse
-            if spec.min_val is not None:
-                arr = np.maximum(arr, spec.min_val)
-            if spec.max_val is not None:
-                arr = np.minimum(arr, spec.max_val)
-            out[c] = arr
+        if c not in out.columns:
+            continue
+        arr = pd.to_numeric(out[c], errors="coerce").to_numpy()
+        link = (spec.link or "").lower()
+
+        if link == "rankgauss":
+            qgrid = spec.params.get("qgrid")
+            if qgrid is None:
+                # no grid: identity fallback
+                inv_arr = arr
+            else:
+                inv_arr = _rankgauss_inverse(arr, qgrid)
+        else:
+            _, inv = LINKS.get(link, LINKS[""])
+            inv_arr = inv(arr)
+
+        if spec.min_val is not None:
+            inv_arr = np.maximum(inv_arr, spec.min_val)
+        if spec.max_val is not None:
+            inv_arr = np.minimum(inv_arr, spec.max_val)
+        out[c] = inv_arr
     return out
 
 # ---------------- inference ----------------
 def infer_schema_from_df(
     df: pd.DataFrame,
     max_categorical_card: int = 50,
-    transform_overrides: Optional[Dict[str, str]] = None
+    transform_overrides: Optional[Dict[str, str]] = None,
+    prefer_rankgauss = True
 ) -> Schema:
     """
     Heuristically infer which columns are continuous vs categorical and choose link functions.
@@ -150,16 +199,10 @@ def infer_schema_from_df(
             if minv is not None and maxv is not None and 0.0 <= minv <= 1.0 and maxv <= 1.0:
                 link = "logit"
             elif minv is not None and minv >= 0.0:
-                # heuristic: substantial multiplicative spread -> log/log1p
-                try:
-                    q10 = float(s.quantile(0.10))
-                    q90 = float(s.quantile(0.90))
-                    # Guard q10>0 to avoid div-by-zero
-                    if q90 > 0 and q10 > 0 and (q90 - q10) > 5.0 * max(1e-6, q10):
-                        link = "log"
-                except Exception:
-                    pass
-
+                link = "log1p"
+            # override with rankgauss if requested (except probability columns)
+            if prefer_rankgauss and not (minv is not None and 0.0 <= minv <= 1.0 and maxv <= 1.0):
+                link = "rankgauss"
             continuous[c] = TypeSpec(kind="continuous", link=link, min_val=minv, max_val=maxv)
         else:
             categoricals.append(c)
