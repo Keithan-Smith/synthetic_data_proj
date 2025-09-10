@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 
 # ---------------- safety helpers ----------------
 # numeric guards for exp/expm1 and sigmoid
@@ -34,33 +35,6 @@ def _sigmoid_stable(x):
     # clip away from exact 0/1 for numerical safety
     return np.clip(out, 1e-8, 1 - 1e-8)
 
-def _fit_rankgauss_quantiles(s: pd.Series, ngrid: int = 2001) -> np.ndarray:
-    v = pd.to_numeric(s, errors="coerce").dropna().values
-    if len(v) < 10:
-        # fallback grid to keep invertible behavior
-        return np.linspace(np.nanmin(v) if len(v) else -1.0, np.nanmax(v) if len(v) else 1.0, ngrid)
-    return np.quantile(v, np.linspace(0, 1, ngrid))
-
-def _rank_to_norm(u: np.ndarray) -> np.ndarray:
-    # map u in (0,1) to N(0,1) via inverse error function
-    u = np.clip(u, 1e-8, 1-1e-8)
-    return np.sqrt(2.0) * np.erfinv(2*u - 1.0)
-
-def _norm_to_rank(z: np.ndarray) -> np.ndarray:
-    return 0.5 * (1.0 + np.erf(z / np.sqrt(2.0)))
-
-def _rankgauss_forward(x: np.ndarray, qgrid: np.ndarray) -> np.ndarray:
-    # empirical CDF via quantile grid
-    idx = np.searchsorted(qgrid, x, side="left")
-    u = idx / max(len(qgrid) - 1, 1)
-    return _rank_to_norm(u)
-
-def _rankgauss_inverse(z: np.ndarray, qgrid: np.ndarray) -> np.ndarray:
-    u = _norm_to_rank(z)
-    idx = (u * (len(qgrid) - 1)).astype(int)
-    idx = np.clip(idx, 0, len(qgrid) - 1)
-    return qgrid[idx]
-
 # ---------------- schema dataclasses ----------------
 @dataclass
 class TypeSpec:
@@ -68,12 +42,15 @@ class TypeSpec:
     link: str = ""
     min_val: Optional[float] = None
     max_val: Optional[float] = None
-    params: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class Schema:
     continuous: Dict[str, TypeSpec] = field(default_factory=dict)
     categoricals: List[str] = field(default_factory=list)
+    # RankGauss inverse cache
+    _rg_mu: Dict[str, float] = field(default_factory=dict, repr=False)
+    _rg_sig: Dict[str, float] = field(default_factory=dict, repr=False)
+    _rg_qgrid: Dict[str, np.ndarray] = field(default_factory=dict, repr=False)  # 1001-pt quantile grid per col
 
     def cont_cols(self) -> List[str]:
         return list(self.continuous.keys())
@@ -85,21 +62,16 @@ class Schema:
 def identity(x): return x
 
 def log_link(x):
-    # protect against log(0) and negatives with a tiny floor
     return np.log(np.maximum(x, 1e-12))
 
 def inv_log_link(x):
-    # overflow-safe exp
     return _safe_exp(x)
 
 def log1p_link(x):
-    # log(1+x), floor at 0 so negatives don’t slip through
     return np.log1p(np.maximum(x, 0.0))
 
 def inv_log1p_link(x):
-    # overflow-safe expm1
     y = _safe_expm1(x)
-    # ensure non-negative domain after inverse
     return np.maximum(y, 0.0)
 
 def logit_link(x):
@@ -109,6 +81,29 @@ def logit_link(x):
 def inv_logit_link(x):
     return _sigmoid_stable(x)
 
+# RankGauss helpers
+def _rankgauss_forward(s: pd.Series) -> Tuple[np.ndarray, float, float, np.ndarray]:
+    r = s.rank(method="average", pct=True).to_numpy(dtype=float)
+    eps = 1e-6
+    r = np.clip(r, eps, 1 - eps)
+    z = norm.ppf(r)
+    mu = float(np.nanmean(z))
+    sig = float(np.nanstd(z) if np.nanstd(z) > 1e-12 else 1.0)
+    zt = (z - mu) / sig
+    # cache quantile grid for inverse
+    try:
+        qgrid = np.quantile(s.to_numpy(dtype=float), np.linspace(0, 1, 1001), method="linear")
+    except TypeError:
+        # numpy<1.22 fallback
+        qgrid = np.quantile(s.to_numpy(dtype=float), np.linspace(0, 1, 1001))
+    return zt, mu, sig, qgrid
+
+def _rankgauss_inverse(arr: np.ndarray, mu: float, sig: float, qgrid: np.ndarray) -> np.ndarray:
+    z = (arr * sig) + mu
+    u = norm.cdf(np.clip(z, -8, 8))  # 0..1
+    idx = np.clip((u * 1000).astype(int), 0, 1000)
+    return qgrid[idx]
+
 LINKS: Dict[str, Tuple] = {
     "":          (identity, identity),
     "identity":  (identity, identity),
@@ -116,6 +111,7 @@ LINKS: Dict[str, Tuple] = {
     "log":       (log_link, inv_log_link),
     "log1p":     (log1p_link, inv_log1p_link),
     "logit":     (logit_link, inv_logit_link),
+    # "rankgauss" handled explicitly
 }
 
 # ---------------- forward / inverse transforms ----------------
@@ -124,17 +120,15 @@ def forward_transform(df: pd.DataFrame, schema: Schema) -> pd.DataFrame:
     for c, spec in schema.continuous.items():
         if c not in out.columns:
             continue
-        arr = pd.to_numeric(out[c], errors="coerce").to_numpy()
-        link = (spec.link or "").lower()
-
-        if link == "rankgauss":
-            # fit grid once per column and cache in spec.params
-            if "qgrid" not in spec.params or spec.params.get("qgrid") is None:
-                spec.params["qgrid"] = _fit_rankgauss_quantiles(out[c])
-            out[c] = _rankgauss_forward(arr, spec.params["qgrid"])
+        if spec.link == "rankgauss":
+            vals, mu, sig, qgrid = _rankgauss_forward(out[c])
+            out[c] = vals
+            schema._rg_mu[c] = mu
+            schema._rg_sig[c] = sig
+            schema._rg_qgrid[c] = qgrid
         else:
-            f, _ = LINKS.get(link, LINKS[""])
-            out[c] = f(arr)
+            f, _ = LINKS.get(spec.link, LINKS[""])
+            out[c] = f(out[c].to_numpy())
     return out
 
 def inverse_transform(df: pd.DataFrame, schema: Schema) -> pd.DataFrame:
@@ -142,40 +136,38 @@ def inverse_transform(df: pd.DataFrame, schema: Schema) -> pd.DataFrame:
     for c, spec in schema.continuous.items():
         if c not in out.columns:
             continue
-        arr = pd.to_numeric(out[c], errors="coerce").to_numpy()
-        link = (spec.link or "").lower()
-
-        if link == "rankgauss":
-            qgrid = spec.params.get("qgrid")
-            if qgrid is None:
-                # no grid: identity fallback
-                inv_arr = arr
+        if spec.link == "rankgauss":
+            mu = schema._rg_mu.get(c, 0.0)
+            sig = schema._rg_sig.get(c, 1.0)
+            qg = schema._rg_qgrid.get(c, None)
+            if qg is None:
+                # graceful fallback: return uniform [0,1]
+                u = norm.cdf(out[c].to_numpy())
+                out[c] = u
             else:
-                inv_arr = _rankgauss_inverse(arr, qgrid)
+                out[c] = _rankgauss_inverse(out[c].to_numpy(), mu, sig, qg)
         else:
-            _, inv = LINKS.get(link, LINKS[""])
-            inv_arr = inv(arr)
-
-        if spec.min_val is not None:
-            inv_arr = np.maximum(inv_arr, spec.min_val)
-        if spec.max_val is not None:
-            inv_arr = np.minimum(inv_arr, spec.max_val)
-        out[c] = inv_arr
+            _, inv = LINKS.get(spec.link, LINKS[""])
+            arr = inv(out[c].to_numpy())
+            if spec.min_val is not None:
+                arr = np.maximum(arr, spec.min_val)
+            if spec.max_val is not None:
+                arr = np.minimum(arr, spec.max_val)
+            out[c] = arr
     return out
 
 # ---------------- inference ----------------
 def infer_schema_from_df(
     df: pd.DataFrame,
     max_categorical_card: int = 50,
-    transform_overrides: Optional[Dict[str, str]] = None,
-    prefer_rankgauss = True
+    transform_overrides: Optional[Dict[str, str]] = None
 ) -> Schema:
     """
     Heuristically infer which columns are continuous vs categorical and choose link functions.
-    - Integers/floats are 'continuous' by default, unless they look like high-cardinality codes you want categorical.
-    - If a column is in [0,1], prefer 'logit'.
-    - If nonnegative and roughly multiplicative spread, prefer 'log' (or override to 'log1p' via transform_overrides).
-    - transform_overrides: dict col -> {"log","log1p","logit","",...}, applied last.
+    Defaults:
+      - Probability/ratio in [0,1] → 'logit'
+      - Everything else numeric → 'rankgauss'
+      - Objects/pandas.Categorical → categorical
     """
     continuous: Dict[str, TypeSpec] = {}
     categoricals: List[str] = []
@@ -183,34 +175,29 @@ def infer_schema_from_df(
     for c in df.columns:
         s = df[c]
 
-        # Treat pandas Categorical and object as categorical outright
+        # Object / pandas Categorical are categorical
         if pd.api.types.is_categorical_dtype(s) or s.dtype == object:
             categoricals.append(c)
             continue
 
         if pd.api.types.is_numeric_dtype(s):
-            # Decide continuous vs categorical: keep numeric as continuous by default.
-            # If you want small-cardinality ints as categorical, handle upstream (as you already do).
             minv = float(np.nanmin(s.to_numpy())) if s.notna().any() else None
             maxv = float(np.nanmax(s.to_numpy())) if s.notna().any() else None
 
             # choose link
-            link = ""
             if minv is not None and maxv is not None and 0.0 <= minv <= 1.0 and maxv <= 1.0:
                 link = "logit"
-            elif minv is not None and minv >= 0.0:
-                link = "log1p"
-            # override with rankgauss if requested (except probability columns)
-            if prefer_rankgauss and not (minv is not None and 0.0 <= minv <= 1.0 and maxv <= 1.0):
+            else:
                 link = "rankgauss"
+
             continuous[c] = TypeSpec(kind="continuous", link=link, min_val=minv, max_val=maxv)
         else:
             categoricals.append(c)
 
-    # apply transform overrides last (e.g., {'Attribute5': 'log1p'})
+    # apply overrides last
     if transform_overrides:
         for col, ln in transform_overrides.items():
-            if col in continuous and ln in LINKS:
+            if col in continuous and (ln in LINKS or ln == "rankgauss"):
                 continuous[col].link = ln
 
     return Schema(continuous=continuous, categoricals=categoricals)
