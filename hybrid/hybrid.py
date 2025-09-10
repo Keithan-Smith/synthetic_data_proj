@@ -14,7 +14,8 @@ from data.schemas import Schema, forward_transform, inverse_transform
 from shocks.spec import ShockSpec
 from shocks.apply import build_corr_override, apply_cont_marginal_shocks
 from privacy.dp import DPConfig, clip_and_noise_, rough_rdp_epsilon
-from privacy.regularizer import PrivacyUtilityRegularizer, PrivacyRegConfig  # (kept for compatibility)
+from privacy.regularizer import PrivacyUtilityRegularizer, PrivacyRegConfig 
+from privacy.mi import MINE 
 
 # ---------------- small type helpers (robust to YAML strings) ----------------
 def _as_bool(x):
@@ -130,7 +131,7 @@ class HybridGenerator:
         self.gan_D = None
         self.cat_ar = CategoricalAR(cat_cols=cat_cols, cont_cols=cont_cols)
         self.train_eps_log = {}
-        self.train_logs = {}            # scalar logs (e.g., mean MMDs)
+        self.train_logs = {}            # scalar logs (e.g., mean MMDs, MI estimates)
         self.priv_cfg = None
         self.priv_reg = None
         self.holdout_idx = None
@@ -184,18 +185,29 @@ class HybridGenerator:
         reg_lam_g = _as_float(reg.get("lambda_mmd_gan", reg.get("lambda_mmd", 0.0)), 0.0)
         reg_lam_v = _as_float(reg.get("lambda_mmd_vae", max(0.0, 0.25 * reg_lam_g)), 0.0)
 
+        # --- MINE config (optional) ---
+        mine_cfg = mine_cfg or {}
+        mine_enabled = _as_bool(mine_cfg.get("enabled", False))
+        mine_lambda = _as_float(mine_cfg.get("lambda", 0.0), 0.0)
+
         self.priv_cfg = privacy_cfg
         self.priv_reg = reg
 
         # --- VAE training ---
         steps = 0
         mmd_vae_sum, mmd_vae_cnt = 0.0, 0
+
+        # MINE for VAE (x,z)
+        latent_dim = self.vae.mu.out_features
+        mine_vae = MINE(x_dim=Xc.shape[1], z_dim=latent_dim, hidden=128, ma_rate=0.01).to(self.device) if mine_enabled else None
+        mine_vae_opt = torch.optim.Adam(mine_vae.parameters(), lr=1e-4) if mine_vae else None
+
         for _ in range(epochs_vae):
             for (xb,) in loader:
                 xb = xb.to(self.device, non_blocking=True)
                 with _autocast_ctx(cuda_on):
-                    recon, mu, logvar = self.vae(xb)
-                    loss, _ = TabularVAE.loss_fn(recon, xb, mu, logvar)
+                    recon, mu_t, logvar = self.vae(xb)
+                    loss, _ = TabularVAE.loss_fn(recon, xb, mu_t, logvar)
 
                     # Mild MMD on recon vs input to help dispersion (utility-leaning)
                     if reg_enabled and reg_lam_v > 0.0:
@@ -203,6 +215,21 @@ class HybridGenerator:
                         loss = loss + reg_lam_v * mmd_v
                     else:
                         mmd_v = None
+
+                    # ---- MINE (VAE): penalize MI(x,z) to discourage memorization ----
+                    if mine_vae and mine_lambda > 0.0:
+                        # update critic: maximize MI -> minimize (-MI)
+                        mine_vae_opt.zero_grad(set_to_none=True)
+                        mine_loss, _ = mine_vae(x=xb.detach(), z=mu_t.detach())
+                        # critic step
+                        mine_loss.backward()
+                        mine_vae_opt.step()
+                        # penalize MI for encoder: add λ * MI == λ * (-mine_loss * -1)
+                        loss = loss + mine_lambda * (-mine_loss)
+                        # log MI estimate
+                        mi_val = float((-mine_loss).detach().cpu())
+                        self.train_logs['mi_est_vae_sum'] = self.train_logs.get('mi_est_vae_sum', 0.0) + mi_val
+                        self.train_logs['mi_est_vae_cnt'] = self.train_logs.get('mi_est_vae_cnt', 0) + 1
 
                 opt.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
@@ -223,6 +250,8 @@ class HybridGenerator:
                 self.train_eps_log['vae_eps'] = float("inf")
         if mmd_vae_cnt > 0:
             self.train_logs['mmd_vae_mean'] = mmd_vae_sum / mmd_vae_cnt
+        if self.train_logs.get('mi_est_vae_cnt', 0) > 0:
+            self.train_logs['mi_est_vae_mean'] = self.train_logs['mi_est_vae_sum'] / self.train_logs['mi_est_vae_cnt']
 
         # 3) Categorical AR
         self.cat_ar.fit(df_fit)
@@ -243,6 +272,14 @@ class HybridGenerator:
         steps = 0
         g_scaler = _make_scaler(cuda_on)
         d_scaler = _make_scaler(cuda_on)
+
+        # MINE for GAN (real_resid, fake_resid)
+        if mine_enabled:
+            mine_gan = MINE(x_dim=R.shape[1], z_dim=R.shape[1], hidden=128, ma_rate=0.01).to(self.device)
+            mine_gan_opt = torch.optim.Adam(mine_gan.parameters(), lr=1e-4)
+        else:
+            mine_gan = None
+            mine_gan_opt = None
 
         mmd_g_sum, mmd_g_cnt = 0.0, 0
         for _ in range(epochs_gan):
@@ -279,6 +316,17 @@ class HybridGenerator:
                     else:
                         mmd_g = None
 
+                    # ---- MINE (GAN): penalize MI(real_resid, fake_resid) ----
+                    if mine_gan and mine_lambda > 0.0:
+                        mine_gan_opt.zero_grad(set_to_none=True)
+                        mine_loss_g, _ = mine_gan(x=rb.detach(), z=fake.detach())
+                        mine_loss_g.backward()
+                        mine_gan_opt.step()
+                        g_loss = g_loss + mine_lambda * (-mine_loss_g)  # add λ * MI
+                        mi_val_g = float((-mine_loss_g).detach().cpu())
+                        self.train_logs['mi_est_gan_sum'] = self.train_logs.get('mi_est_gan_sum', 0.0) + mi_val_g
+                        self.train_logs['mi_est_gan_cnt'] = self.train_logs.get('mi_est_gan_cnt', 0) + 1
+
                 g_opt.zero_grad(set_to_none=True)
                 g_scaler.scale(g_loss).backward()
                 if dp:
@@ -298,6 +346,8 @@ class HybridGenerator:
                 self.train_eps_log['gan_eps'] = float("inf")
         if mmd_g_cnt > 0:
             self.train_logs['mmd_gan_mean'] = mmd_g_sum / mmd_g_cnt
+        if self.train_logs.get('mi_est_gan_cnt', 0) > 0:
+            self.train_logs['mi_est_gan_mean'] = self.train_logs['mi_est_gan_sum'] / self.train_logs['mi_est_gan_cnt']
 
         return self
 
@@ -325,7 +375,7 @@ class HybridGenerator:
             X = (recon + resid).cpu().numpy()
         cont_syn = pd.DataFrame(X, columns=self.cont_cols)
 
-        # 5) categoricals with optional logit bias (no-op if AR ignores it)
+        # 5) categoricals with optional logit bias
         cat_syn = self.cat_ar.sample(n, cont_syn, logit_bias=spec.cat_logit_bias)
 
         out = pd.concat([cont_syn, cat_syn], axis=1)
