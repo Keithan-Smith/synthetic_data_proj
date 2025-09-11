@@ -27,7 +27,7 @@ from shocks.spec import ShockSpec
 
 from eval.eval_credit import evaluate_synth_vs_real
 from eval.fidelity import univariate_fidelity, correlation_diff
-from eval.privacy import membership_inference_auc
+from eval.privacy import membership_inference_auc, distance_to_closest_record
 from eval.utility import generic_binary_downstream_eval
 from eval.viz import plot_histograms, plot_pca, plot_corr_compare
 from eval.report import build_report
@@ -243,7 +243,7 @@ def _calibrate_mean_rate(pd_series: pd.Series, target_rate: float):
         if m < target_rate: lo = mid
         else: hi = mid
     b = 0.5*(lo+hi)
-    shifted = pd_series.copy()
+    shifted = pd.Series(p, index=pd_series.index)
     shifted.loc[mask] = _sigm(z + b)
     return shifted, float(b)
 
@@ -260,14 +260,11 @@ def _max_epsilon_from_log(train_eps_log: dict|None) -> float|None:
     return max(vals) if vals else None
 
 def _tradeoff_metrics(hg, df_real, syn_o, cont_cols) -> dict:
-    # Utility: train on synth → test on real
     util = generic_binary_downstream_eval(train_df=syn_o, test_df=df_real, target_col='bad_within_horizon',
                                           cont_cols=cont_cols, cat_cols=None)
     auc = util.get("auc")
     ar = (2*auc - 1.0) if (auc is not None and np.isfinite(auc)) else None
-    # Privacy: MIA AUC
     mia = membership_inference_auc(df_real, syn_o, cont_cols)
-    # Formal DP ε (max across sub-trainers)
     eps = _max_epsilon_from_log(getattr(hg, "train_eps_log", None))
     return {"auc": auc, "ar": ar, "mia_auc": mia, "epsilon": eps}
 
@@ -280,15 +277,13 @@ def _plot_tradeoff(xvals, yvals, xlabel, ylabel, out_path, title=None):
         plt.title(title)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    # ensure parent dir exists
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     plt.savefig(out_path, dpi=150)
     plt.close()
 
 def _sweep_privacy_utility(cfg, df, schema, cont_cols, cat_cols, base_privacy_cfg, out_dir):
     """
-    Runs optional sweeps over dp_noise_multiplier and/or privreg_lambda_gan.
-    Writes CSV + plots under the provided out_dir (pass eval_out_dir to colocate with CAP metrics).
+    Optional sweeps over dp_noise_multiplier and/or privreg_lambda_gan.
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -324,7 +319,9 @@ def _sweep_privacy_utility(cfg, df, schema, cont_cols, cat_cols, base_privacy_cf
                epochs_gan=getattr(cfg, "gan_epochs", 100),
                batch=getattr(cfg, "batch_size", 256),
                privacy_cfg=p_cfg,
-               privacy_reg_cfg=privreg_cfg)
+               privacy_reg_cfg=privreg_cfg,
+               mine_cfg={"enabled": bool(getattr(cfg, "mine_enabled", False)),
+                         "lambda": float(getattr(cfg, "mine_lambda", 0.0))})
 
         syn = hg.sample(len(df), shock=ShockSpec())
         if 'bad_within_horizon' not in syn.columns and 'bad_within_horizon' in df.columns:
@@ -351,7 +348,6 @@ def _sweep_privacy_utility(cfg, df, schema, cont_cols, cat_cols, base_privacy_cf
     res = pd.DataFrame(rows)
     res.to_csv(os.path.join(out_dir, "tradeoff_results.csv"), index=False)
 
-    # A) DP axis (if present and we got eps)
     dp_mask = res["dp_noise_multiplier"].notna()
     if dp_mask.any() and res.loc[dp_mask, "epsilon"].notna().any():
         r = res.loc[dp_mask].sort_values("epsilon")
@@ -360,18 +356,17 @@ def _sweep_privacy_utility(cfg, df, schema, cont_cols, cat_cols, base_privacy_cf
             if r["auc"].notna().any():
                 _plot_tradeoff(
                     r["epsilon"], r["auc"],
-                    "ε (RDP approx)", "AUC (synth→real)",
+                    "ε (approx RDP)", "AUC (synth→real)",
                     os.path.join(out_dir, "tradeoff_auc_vs_epsilon.png"),
                     title="Utility vs Privacy (DP)"
                 )
             if r["mia_auc"].notna().any():
                 _plot_tradeoff(
                     r["epsilon"], r["mia_auc"],
-                    "ε (RDP approx)", "MIA-AUC (lower=better privacy)",
+                    "ε (approx RDP)", "MIA-AUC (lower=better)",
                     os.path.join(out_dir, "tradeoff_mia_vs_epsilon.png")
                 )
 
-    # B) MMD axis (if present)
     lam_mask = res["privreg_lambda_gan"].notna()
     if lam_mask.any():
         r = res.loc[lam_mask].sort_values("privreg_lambda_gan")
@@ -386,7 +381,7 @@ def _sweep_privacy_utility(cfg, df, schema, cont_cols, cat_cols, base_privacy_cf
             if r["mia_auc"].notna().any():
                 _plot_tradeoff(
                     r["privreg_lambda_gan"], r["mia_auc"],
-                    "MMD λ (GAN)", "MIA-AUC (lower=better privacy)",
+                    "MMD λ (GAN)", "MIA-AUC (lower=better)",
                     os.path.join(out_dir, "tradeoff_mia_vs_lambda.png")
                 )
 
@@ -399,6 +394,9 @@ def run(cfg_path: str):
     if not getattr(cfg, "output_dir", None):
         cfg.output_dir = "outputs"
     os.makedirs(cfg.output_dir, exist_ok=True)
+
+    # minimal evaluation knob (metrics-only)
+    eval_minimal = bool(getattr(cfg, "eval_minimal", True))
 
     # CUDA -> CPU fallback
     if str(getattr(cfg, "device", "cuda")).lower() == "cuda" and not torch.cuda.is_available():
@@ -455,7 +453,7 @@ def run(cfg_path: str):
     try:
         hg = HybridGenerator(cont_cols=cont_cols, cat_cols=cat_cols, schema=schema, device=cfg.device)
 
-        # Formal DP toggles (cast to proper types)
+        # DP settings (approx RDP)
         privacy_cfg = {
             "enabled": _parse_bool(getattr(cfg, "privacy_enabled", False)),
             "dp_max_grad_norm": float(getattr(cfg, "dp_max_grad_norm", 1.0)),
@@ -463,10 +461,10 @@ def run(cfg_path: str):
             "dp_delta": float(getattr(cfg, "dp_delta", 1e-5)),
         }
 
-        # privacy–utility regularizer (safe defaults mean "off")
+        # privacy–utility regularizer (MMD) — off by default for clean MINE attribution
         privacy_reg_cfg = {
             "enabled": _parse_bool(getattr(cfg, "privreg_enabled", False)),
-            "mode": str(getattr(cfg, "privreg_mode", "attractive")).lower(),  # 'attractive'|'repulsive'
+            "mode": str(getattr(cfg, "privreg_mode", "attractive")).lower(),
             "lambda_mmd": float(getattr(cfg, "privreg_lambda", 0.0)),
             "lambda_mmd_gan": float(getattr(cfg, "privreg_lambda_gan", getattr(cfg, "privreg_lambda", 0.0))),
             "lambda_mmd_vae": float(getattr(cfg, "privreg_lambda_vae",
@@ -474,11 +472,17 @@ def run(cfg_path: str):
             "mmd_bandwidth": float(getattr(cfg, "privreg_mmd_bandwidth", 1.0)),
         }
 
+        mine_cfg = {
+            "enabled": _parse_bool(getattr(cfg, "mine_enabled", False)),
+            "lambda": float(getattr(cfg, "mine_lambda", 0.0)),
+        }
+
         hg.fit(df, epochs_vae=getattr(cfg, "vae_epochs", 20),
                epochs_gan=getattr(cfg, "gan_epochs", 100),
                batch=getattr(cfg, "batch_size", 256),
                privacy_cfg=privacy_cfg,
-               privacy_reg_cfg=privacy_reg_cfg)
+               privacy_reg_cfg=privacy_reg_cfg,
+               mine_cfg=mine_cfg)
     except Exception as e:
         raise RuntimeError(f"Failed to initialize/train HybridGenerator. "
                            f"cont_cols={cont_cols}, cat_cols={cat_cols}. "
@@ -513,8 +517,8 @@ def run(cfg_path: str):
             pdcal = PDCalibrator(cont_cols=sel_cont, cat_cols=sel_cat, horizon_months=horizon)
             pdcal.fit(df.copy(), target_col="bad_within_horizon")
 
-    # 4) Sample synthetic originations (with optional shocks)
-    use_shock = _parse_bool(getattr(cfg, "shock_enabled", True))
+    # 4) Sample synthetic originations (shocks capability kept, usually off)
+    use_shock = _parse_bool(getattr(cfg, "shock_enabled", False))  # default False per study scope
     shock_spec = _parse_shock_from_cfg(cfg) if use_shock else ShockSpec()
     syn_o = hg.sample(len(df), shock=shock_spec)
 
@@ -554,7 +558,6 @@ def run(cfg_path: str):
             mortgage_heuristic=getattr(cfg, "mortgage_heuristic", None),
         )
 
-        # normalize output (map columns & humanize codes)
         try:
             panel = normalize_df(
                 panel,
@@ -567,7 +570,6 @@ def run(cfg_path: str):
 
         panel = _ensure_pd_columns(panel)
 
-        # Calibrate PDs to target avg rate (default 2%)
         target_rate = float(getattr(cfg, "pd_target_rate", 0.02))
         if "pd_12m" in panel.columns:
             panel["pd_12m_cal"], _ = _calibrate_mean_rate(panel["pd_12m"], target_rate)
@@ -582,12 +584,12 @@ def run(cfg_path: str):
 
         panel.to_csv(f"{cfg.output_dir}/panel_synth.csv", index=False)
 
-    # 6) Core evaluation
+    # 6) Core evaluation (metrics-focused)
     cont_eval = [c for c in cont_cols if c != "loan_balance"]
     fid  = univariate_fidelity(df, syn_o, cont_cols)
     corr = correlation_diff(df, syn_o, cont_eval)
 
-    # --- sanitize features for utility: intersection only; exclude PD/targets
+    # sanitize for utility
     _RESERVED = {
         "bad_within_horizon", "default_flag",
         "pd_12m", "pd_monthly", "pd_12m_cal", "pd_monthly_cal", "pd", "pd_score"
@@ -603,6 +605,7 @@ def run(cfg_path: str):
         cat_cols=cat_for_util,
     )
     mia  = membership_inference_auc(df, syn_o, cont_cols)
+    dcr  = distance_to_closest_record(df, syn_o, cont_cols)
 
     # ---------- Credit evaluation (+ colocated sweep writing) ----------
     try:
@@ -636,7 +639,6 @@ def run(cfg_path: str):
             disperse_with_quantiles=getattr(cfg, "disperse_quantiles", False),
         )
 
-        # ---- Privacy–Utility sweeps (write right here, same try, same folder) ----
         swp = getattr(cfg, "sweep", None)
         if swp and bool(swp.get("enabled", False)):
             try:
@@ -658,13 +660,12 @@ def run(cfg_path: str):
         with open(f"{cfg.output_dir}/pipeline_warning.txt","a") as f:
             f.write("\n[eval_credit] " + str(e))
 
-    # ---------- Optional baselines/ablations for comparative claims ----------
+    # ---------- Optional baselines/ablations ----------
     try:
         if _parse_bool(getattr(cfg, "run_baselines", False)):
             base_dir = os.path.join(cfg.output_dir, "baselines")
             os.makedirs(base_dir, exist_ok=True)
 
-            # Ablation: identical training but privacy regularizer OFF
             hg_noreg = HybridGenerator(cont_cols=cont_cols, cat_cols=cat_cols, schema=schema, device=cfg.device)
             privacy_cfg2 = {
                 "enabled": _parse_bool(getattr(cfg, "privacy_enabled", False)),
@@ -673,12 +674,8 @@ def run(cfg_path: str):
                 "dp_delta": float(getattr(cfg, "dp_delta", 1e-5)),
             }
             privreg_off = {
-                "enabled": False,
-                "mode": "attractive",
-                "lambda_mmd": 0.0,
-                "lambda_mmd_gan": 0.0,
-                "lambda_mmd_vae": 0.0,
-                "mmd_bandwidth": 1.0,
+                "enabled": False, "mode": "attractive",
+                "lambda_mmd": 0.0, "lambda_mmd_gan": 0.0, "lambda_mmd_vae": 0.0, "mmd_bandwidth": 1.0,
             }
             hg_noreg.fit(
                 df,
@@ -686,9 +683,10 @@ def run(cfg_path: str):
                 epochs_gan=getattr(cfg, "gan_epochs", 100),
                 batch=getattr(cfg, "batch_size", 256),
                 privacy_cfg=privacy_cfg2,
-                privacy_reg_cfg=privreg_off
+                privacy_reg_cfg=privreg_off,
+                mine_cfg={"enabled": False, "lambda": 0.0}
             )
-            syn_noreg = hg_noreg.sample(len(df), shock=_parse_shock_from_cfg(cfg) if _parse_bool(getattr(cfg,"shock_enabled",True)) else ShockSpec())
+            syn_noreg = hg_noreg.sample(len(df), shock=_parse_shock_from_cfg(cfg) if _parse_bool(getattr(cfg,"shock_enabled",False)) else ShockSpec())
             if pdcal is not None:
                 syn_noreg["pd_12m"] = pdcal.predict_pd(syn_noreg)
                 syn_noreg["pd_monthly"] = 1.0 - (1.0 - syn_noreg["pd_12m"].clip(0,1))**(1/12)
@@ -700,7 +698,6 @@ def run(cfg_path: str):
                     base = float(df['bad_within_horizon'].mean())
                     syn_noreg['bad_within_horizon'] = (np.random.rand(len(syn_noreg)) < base).astype(int)
 
-            # Evaluate ablation (with sanitized features)
             _RESERVED = {
                 "bad_within_horizon", "default_flag",
                 "pd_12m", "pd_monthly", "pd_12m_cal", "pd_monthly_cal", "pd", "pd_score"
@@ -742,7 +739,7 @@ def run(cfg_path: str):
         with open(f"{cfg.output_dir}/pipeline_warning.txt","a") as f:
             f.write("\n[baselines] " + str(e))
 
-    # 7) Save + visuals + report
+    # 7) Save + metrics-focused outputs (+ minimal visuals only if enabled)
     out = cfg.output_dir
     syn_o = normalize_df(
         syn_o, column_map_path=(colmap_path or None), alias_pack_path=(alias_path or None), parse_dates=True
@@ -756,28 +753,33 @@ def run(cfg_path: str):
         f.write(f"Utility PD AUC(synth->real): {util.get('auc')}\n")
         f.write(f"Utility PD Brier(synth->real): {util.get('brier')}\n")
         f.write(f"Membership inference AUC: {mia}\n")
-        if hasattr(hg, 'train_eps_log'): f.write(f"DP eps log: {hg.train_eps_log}\n")
+        f.write(f"DCR synth mean: {dcr.get('dcr_synth_mean')}\n")
+        f.write(f"Reident rate @ real p1 tau: {dcr.get('reident_rate_tau_p1')}\n")
+        if hasattr(hg, 'train_eps_log'):
+            f.write(f"DP eps log (ε is approx RDP): {hg.train_eps_log}\n")
         if hasattr(hg, 'priv_reg'):     f.write(f"PrivReg cfg: {getattr(hg,'priv_reg',{})}\n")
         if hasattr(hg, 'train_logs'):   f.write(f"Train logs: {getattr(hg,'train_logs',{})}\n")
 
-    # Visuals
+    # Minimal visuals (skip heavy plots if eval_minimal=True)
     try:
-        viz_top_k = getattr(cfg, "viz_top_k", None)
-        if viz_top_k is None:
-            viz_top_k = min(12, len(cont_cols))
-        cols_to_plot = cont_cols[:viz_top_k]
-        plot_histograms(df, syn_o, cols_to_plot, out)
-        plot_pca(df, syn_o, [c for c in cont_cols if c != "loan_balance"], out)
+        if not eval_minimal:
+            viz_top_k = getattr(cfg, "viz_top_k", None)
+            if viz_top_k is None:
+                viz_top_k = min(12, len(cont_cols))
+            cols_to_plot = cont_cols[:viz_top_k]
+            plot_histograms(df, syn_o, cols_to_plot, out)
+            plot_pca(df, syn_o, [c for c in cont_cols if c != "loan_balance"], out)
     except Exception as e:
         with open(f"{out}/pipeline_warning.txt","a") as f: f.write("\n[viz] "+str(e))
 
-    # Correlation compare + report
+    # Correlation compare + report (skip when minimal)
     try:
-        common_numeric = [c for c in df.columns if c in syn_o.columns and pd.api.types.is_numeric_dtype(df[c])]
-        stats_corr = plot_corr_compare(df, syn_o, common_numeric, cfg.output_dir, method="pearson",
-                                       fname_prefix="corr_compare")
-        with open(f"{cfg.output_dir}/corr_compare_stats.txt", "w") as f:
-            f.write(str(stats_corr))
+        if not eval_minimal:
+            common_numeric = [c for c in df.columns if c in syn_o.columns and pd.api.types.is_numeric_dtype(df[c])]
+            stats_corr = plot_corr_compare(df, syn_o, common_numeric, cfg.output_dir, method="pearson",
+                                           fname_prefix="corr_compare")
+            with open(f"{cfg.output_dir}/corr_compare_stats.txt", "w") as f:
+                f.write(str(stats_corr))
     except Exception as e:
         with open(f"{out}/pipeline_warning.txt","a") as f: f.write("\n[corr_compare] "+str(e))
 
