@@ -150,7 +150,7 @@ class CategoricalAR:
         # First attempt: lbfgs
         with warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always", category=ConvergenceWarning)
-            lr = LogisticRegression(solver="lbfgs", penalty="l2", C=1.0, max_iter=4000, multi_class="multinomial", class_weight="balanced")
+            lr = LogisticRegression(solver="lbfgs", penalty="l2", C=1.0, max_iter=4000)
             lr.fit(X, y)
             conv_warn = any(isinstance(w.message, ConvergenceWarning) for w in rec)
 
@@ -158,10 +158,7 @@ class CategoricalAR:
             return lr
 
         # Fallback: saga (handles large sparse-ish OHEs better), more iters, stronger reg
-        lr2 = LogisticRegression(
-        solver="saga", penalty="l2", C=0.5, max_iter=8000,
-            multi_class="multinomial", class_weight="balanced"
-            )
+        lr2 = LogisticRegression(solver="saga", penalty="l2", C=0.5, max_iter=8000)
         lr2.fit(X, y)
         return lr2
 
@@ -270,7 +267,8 @@ class CategoricalAR:
 
         return self
 
-    def sample(self, n: int, cont_syn: Optional[pd.DataFrame], **kwargs) -> pd.DataFrame:
+    def sample(self, n: int, cont_syn: Optional[pd.DataFrame], logit_bias: Optional[dict] = None, **kwargs) -> pd.DataFrame:
+        logit_bias = logit_bias or {}
         # output index
         if cont_syn is not None and isinstance(cont_syn, pd.DataFrame) and len(cont_syn) == n:
             index_like = cont_syn.index
@@ -317,9 +315,20 @@ class CategoricalAR:
                 out[tgt] = model.predict(X_design)
                 continue
 
+            # Optional per-class bias: key = f"{tgt}::{level}" ; value = logit offset
             p = np.asarray(proba, dtype=float)
             p = np.clip(p, 1e-12, 1.0)
-            p = p / p.sum(axis=1, keepdims=True)
+
+            if logit_bias:
+                logp = np.log(p)
+                bias_vec = np.array([float(logit_bias.get(f"{tgt}::{str(cls)}", 0.0)) for cls in classes], dtype=float)
+                logp = logp + bias_vec.reshape(1, -1)
+                logp = logp - logp.max(axis=1, keepdims=True)
+                p = np.exp(logp)
+                p = p / p.sum(axis=1, keepdims=True)
+            else:
+                p = p / p.sum(axis=1, keepdims=True)
+
             draws = [rng.choice(classes, p=p[i]) for i in range(p.shape[0])]
             out[tgt] = np.array(draws, dtype=object)
 
