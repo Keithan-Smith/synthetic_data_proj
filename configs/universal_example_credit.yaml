@@ -47,6 +47,10 @@ privreg_lambda_gan: 1.0
 privreg_lambda_vae: 0.25
 privreg_mmd_bandwidth: 1.0
 
+# MINE (privacy–utility regularizer)
+mine_enabled: true
+mine_lambda: 0.2
+
 # === Baselines / Ablations ===
 run_baselines: true               # writes outputs/.../baselines/no_privreg
 
@@ -97,3 +101,4 @@ shock:
 
 # Optional eval quality-of-life
 viz_top_k: 12
+eval_minimal: true
