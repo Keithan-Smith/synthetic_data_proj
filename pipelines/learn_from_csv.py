@@ -261,7 +261,8 @@ def _max_epsilon_from_log(train_eps_log: dict|None) -> float|None:
 
 def _tradeoff_metrics(hg, df_real, syn_o, cont_cols) -> dict:
     util = generic_binary_downstream_eval(train_df=syn_o, test_df=df_real, target_col='bad_within_horizon',
-                                          cont_cols=cont_cols, cat_cols=None)
+                                          cont_cols=cont_cols, cat_cols=None, 
+                                          return_scores = True)
     auc = util.get("auc")
     ar = (2*auc - 1.0) if (auc is not None and np.isfinite(auc)) else None
     mia = membership_inference_auc(df_real, syn_o, cont_cols)
@@ -604,6 +605,9 @@ def run(cfg_path: str):
         cont_cols=cont_for_util,
         cat_cols=cat_for_util,
     )
+    # Save labels/scores for DeLong later
+    np.savez(os.path.join(cfg.output_dir, "eval_scores_main.npz"),
+            y=util["y_true"], p=util["scores"])
     mia  = membership_inference_auc(df, syn_o, cont_cols)
     dcr  = distance_to_closest_record(df, syn_o, cont_cols)
 
@@ -710,6 +714,8 @@ def run(cfg_path: str):
                 train_df=syn_noreg, test_df=df, target_col='bad_within_horizon',
                 cont_cols=cont_b, cat_cols=cat_b
             )
+            np.savez(os.path.join(bdir, "eval_scores_noreg.npz"),
+                y=util_b["y_true"], p=util_b["scores"])
             mia_b  = membership_inference_auc(df, syn_noreg, cont_cols)
 
             bdir = os.path.join(base_dir, "no_privreg")
