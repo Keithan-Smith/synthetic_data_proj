@@ -159,7 +159,8 @@ def generic_binary_downstream_eval(
     target_col: Optional[str] = None,
     cont_cols: Optional[List[str]] = None,
     cat_cols: Optional[List[str]] = None,
-    max_iter: int = 2000
+    max_iter: int = 2000,
+    return_scores: bool = True
 ) -> Dict[str, float]:
     """
     Fits LogisticRegression on train_df -> predicts on test_df target.
@@ -243,4 +244,9 @@ def generic_binary_downstream_eval(
         out["acc"] = float(accuracy_score(y_true, y_hat))
     except Exception:
         out["acc"] = None
+
+    if return_scores:                       
+        out["y_true"] = y_true.to_numpy()     # ndarray for DeLong
+        out["scores"] = p
+    
     return out
