@@ -22,7 +22,7 @@ purpose_to_asset:
   "business": business
   "other": unsecured
 
-output_dir: "outputs/credit_run"
+output_dir: "outputs/credit_mine_on"
 seed: 242
 device: "cuda"
 
@@ -102,3 +102,5 @@ shock:
 # Optional eval quality-of-life
 viz_top_k: 12
 eval_minimal: true
+
+compare_to_output_dir: "outputs/credit_noreg"
