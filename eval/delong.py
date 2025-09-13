@@ -1,84 +1,113 @@
+from __future__ import annotations
 import math
+import argparse
 import numpy as np
+import pandas as pd
 
-try:
-    from scipy.stats import norm as _norm  # optional but preferred
-    _HAS_SCIPY = True
-except Exception:
-    _HAS_SCIPY = False
+def _midrank(x: np.ndarray) -> np.ndarray:
+    """Midranks (1..N) with tie handling."""
+    J = np.argsort(x, kind="mergesort")
+    Z = x[J]
+    N = Z.size
+    T = np.empty(N, dtype=float)
+    i = 0
+    while i < N:
+        j = i
+        while j < N and Z[j] == Z[i]:
+            j += 1
+        # average of ranks i..(j-1), +1 to convert 0-based to 1-based
+        T[i:j] = 0.5 * (i + j - 1) + 1.0
+        i = j
+    R = np.empty(N, dtype=float)
+    R[J] = T
+    return R
 
-def _zcrit(alpha: float) -> float:
-    return float(_norm.ppf(1 - alpha/2)) if _HAS_SCIPY else 1.959963984540054
-
-def _ncdf(x: float) -> float:
-    if _HAS_SCIPY:
-        return float(_norm.cdf(x))
-    # Gaussian CDF fallback via erf
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-def _pairwise_v(pos: np.ndarray, neg: np.ndarray) -> np.ndarray:
-    # v_{ij} = 1 if pos_i > neg_j; 0.5 if tie; 0 else
-    diff = pos[:, None] - neg[None, :]
-    return (diff > 0).astype(float) + 0.5 * (diff == 0)
-
-def auc_and_variance(y_true, scores):
-    y = np.asarray(y_true).astype(int)
-    s = np.asarray(scores, dtype=float)
-    pos = s[y == 1]; neg = s[y == 0]
-    m, n = len(pos), len(neg)
-    if m == 0 or n == 0:
-        return float("nan"), float("nan")
-    v = _pairwise_v(pos, neg)
-    auc = float(v.mean())
-    v10 = v.mean(axis=1)  # per-positive
-    v01 = v.mean(axis=0)  # per-negative
-    var = (np.var(v10, ddof=1) / m) + (np.var(v01, ddof=1) / n)
-    return auc, float(var)
-
-def auc_delong_ci(y_true, scores, alpha: float = 0.05):
-    auc, var = auc_and_variance(y_true, scores)
-    if not np.isfinite(var):
-        return auc, (float("nan"), float("nan"))
-    se = math.sqrt(max(var, 0.0))
-    z = _zcrit(alpha)
-    return auc, (max(0.0, auc - z * se), min(1.0, auc + z * se))
-
-def delong_2sample(y_true, scores1, scores2, alpha: float = 0.05):
+def _fast_delong(scores: np.ndarray, y: np.ndarray):
     """
-    Paired DeLong for two models on the same (y_true, X_test).
-    Returns delta=AUC1-AUC2, its SE, z, p, and a CI for the delta.
+    Vectorized DeLong for one or more models.
+    scores: shape (K, N) with higher=more positive
+    y:      shape (N,), 1=positive, 0=negative
+    Returns: aucs (K,), covariance matrix (K,K)
     """
-    y = np.asarray(y_true).astype(int)
-    s1 = np.asarray(scores1, dtype=float)
-    s2 = np.asarray(scores2, dtype=float)
-    idx_pos, idx_neg = (y == 1), (y == 0)
-    pos1, neg1 = s1[idx_pos], s1[idx_neg]
-    pos2, neg2 = s2[idx_pos], s2[idx_neg]
-    m, n = len(pos1), len(neg1)
-    if m == 0 or n == 0:
-        return dict(delta=np.nan, se=np.nan, z=np.nan, p=np.nan, ci=(np.nan, np.nan),
-                    auc1=np.nan, auc2=np.nan)
+    y = y.astype(int)
+    pos = y == 1
+    neg = ~pos
+    m = int(pos.sum())
+    n = int(neg.sum())
+    assert m > 0 and n > 0, "Need both positive and negative samples."
 
-    v1 = _pairwise_v(pos1, neg1)
-    v2 = _pairwise_v(pos2, neg2)
-    auc1 = float(v1.mean()); auc2 = float(v2.mean())
+    K, N = scores.shape
+    v10 = np.empty((K, m), dtype=float)
+    v01 = np.empty((K, n), dtype=float)
+    aucs = np.empty(K, dtype=float)
 
-    v10_1, v01_1 = v1.mean(axis=1), v1.mean(axis=0)
-    v10_2, v01_2 = v2.mean(axis=1), v2.mean(axis=0)
+    for k in range(K):
+        s = scores[k]
+        A = s[pos]
+        B = s[neg]
+        r = _midrank(np.concatenate([A, B], axis=0))
+        rA = r[:m]
+        rB = r[m:]
+        v10[k] = (rA - (m + 1) / 2.0) / n
+        v01[k] = ((m + n + 1) / 2.0 - rB) / m
+        aucs[k] = v10[k].mean()
 
-    var1 = (np.var(v10_1, ddof=1) / m) + (np.var(v01_1, ddof=1) / n)
-    var2 = (np.var(v10_2, ddof=1) / m) + (np.var(v01_2, ddof=1) / n)
+    # population covariances
+    S10 = np.cov(v10, bias=True)
+    S01 = np.cov(v01, bias=True)
+    cov = S10 / m + S01 / n
+    return aucs, cov
 
-    cov_v10 = np.cov(v10_1, v10_2, ddof=1)[0, 1] if m > 1 else 0.0
-    cov_v01 = np.cov(v01_1, v01_2, ddof=1)[0, 1] if n > 1 else 0.0
-    cov12 = (cov_v10 / m) + (cov_v01 / n)
+def _norm_cdf(z: float) -> float:
+    # stable standard normal CDF without SciPy
+    return 0.5 * math.erfc(-z / math.sqrt(2.0))
 
-    delta = auc1 - auc2
-    var_delta = var1 + var2 - 2.0 * cov12
-    se = math.sqrt(max(var_delta, 0.0))
-    z = (delta / se) if se > 0 else float("inf")
-    p = 2.0 * (1.0 - _ncdf(abs(z)))
-    zc = _zcrit(alpha)
-    ci = (delta - zc * se, delta + zc * se)
-    return dict(delta=float(delta), se=float(se), z=float(z), p=float(p), ci=(float(ci[0]), float(ci[1])),
-                auc1=float(auc1), auc2=float(auc2))
+def delong_two_model_test(y: np.ndarray, s_a: np.ndarray, s_b: np.ndarray):
+    """
+    Returns dict with AUCs, delta, z, p, se, ci95.
+    """
+    scores = np.vstack([s_a, s_b])
+    aucs, cov = _fast_delong(scores, y)
+    delta = aucs[0] - aucs[1]
+    var = cov[0, 0] + cov[1, 1] - 2 * cov[0, 1]
+    se = math.sqrt(max(var, 1e-18))
+    z = delta / se
+    p = 2.0 * (1.0 - _norm_cdf(abs(z)))
+    z95 = 1.959963984540054
+    ci = (delta - z95 * se, delta + z95 * se)
+    return {
+        "auc_a": float(aucs[0]),
+        "auc_b": float(aucs[1]),
+        "delta_auc": float(delta),
+        "se": float(se),
+        "z": float(z),
+        "p": float(p),
+        "ci95_low": float(ci[0]),
+        "ci95_high": float(ci[1]),
+    }
+
+def _read_scores_csv(path: str):
+    # Expect columns: 'y' and 'score'
+    df = pd.read_csv(path)
+    if "y" not in df.columns or "score" not in df.columns:
+        raise ValueError(f"{path} must contain columns: y, score")
+    y = df["y"].astype(int).to_numpy()
+    s = df["score"].astype(float).to_numpy()
+    return y, s
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--scores_a", required=True, help="CSV with columns y,score (run A)")
+    ap.add_argument("--scores_b", required=True, help="CSV with columns y,score (run B)")
+    args = ap.parse_args()
+
+    y_a, s_a = _read_scores_csv(args.scores_a)
+    y_b, s_b = _read_scores_csv(args.scores_b)
+    if len(y_a) != len(y_b) or np.any(y_a != y_b):
+        raise ValueError("Label vectors must match (same test set and order).")
+    res = delong_two_model_test(y_a, s_a, s_b)
+    for k, v in res.items():
+        print(f"{k}: {v}")
+
+if __name__ == "__main__":
+    main()

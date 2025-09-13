@@ -14,8 +14,7 @@ from data.schemas import Schema, forward_transform, inverse_transform
 from shocks.spec import ShockSpec
 from shocks.apply import build_corr_override, apply_cont_marginal_shocks
 from privacy.dp import DPConfig, clip_and_noise_, rough_rdp_epsilon
-from privacy.regularizer import PrivacyUtilityRegularizer, PrivacyRegConfig 
-from privacy.mi import MINE 
+from privacy.mi import MINE  # <-- MINE
 
 # ---------------- small type helpers (robust to YAML strings) ----------------
 def _as_bool(x):
@@ -40,7 +39,6 @@ def _make_scaler(cuda_enabled: bool):
     Falls back to torch.cuda.amp (old), and to a no-op if AMP is unavailable.
     """
     try:
-        # Most torch versions accept this form
         return amp.GradScaler(enabled=cuda_enabled)
     except TypeError:
         try:
@@ -59,13 +57,10 @@ def _autocast_ctx(cuda_enabled: bool):
     Return an autocast context manager compatible with both new and old APIs.
     """
     if cuda_enabled:
-        # prefer new API if available
         try:
             sig = inspect.signature(amp.autocast)
             if len(sig.parameters) >= 1:
-                # new-style requires device string
                 return amp.autocast('cuda')
-            # older torch.amp with enabled kw
             return amp.autocast(enabled=True)
         except Exception:
             try:
@@ -74,7 +69,6 @@ def _autocast_ctx(cuda_enabled: bool):
             except Exception:
                 return nullcontext()
     else:
-        # disabled context
         try:
             sig = inspect.signature(amp.autocast)
             if "enabled" in sig.parameters:
@@ -111,7 +105,6 @@ def _rbf_mmd2(x: torch.Tensor, y: torch.Tensor, sigma: float = 1.0) -> torch.Ten
     Kyy = _rbf(y, y)
     Kxy = _rbf(x, y)
 
-    # Unbiased: remove diagonal terms for Kxx/Kyy
     Kxx = (Kxx.sum() - Kxx.diag().sum()) / (bx * (bx - 1))
     Kyy = (Kyy.sum() - Kyy.diag().sum()) / (by * (by - 1))
     Kxy = Kxy.mean()
@@ -146,7 +139,7 @@ class HybridGenerator:
             df_fit_cont = forward_transform(df_fit[self.cont_cols], self.schema)
         else:
             df_fit_cont = df_fit[self.cont_cols].copy()
-        
+
         mu = df_fit_cont.mean(axis=0)
         sd = df_fit_cont.std(axis=0).replace(0.0, 1.0)
         self._cont_stats = {c: (float(mu[c]), float(sd[c])) for c in self.cont_cols}
@@ -187,8 +180,9 @@ class HybridGenerator:
 
         # --- MINE config (optional) ---
         mine_cfg = mine_cfg or {}
-        mine_enabled = _as_bool(mine_cfg.get("enabled", False))
-        mine_lambda = _as_float(mine_cfg.get("lambda", 0.0), 0.0)
+        # accept either a dedicated mine_cfg OR keys in priv_cfg
+        mine_enabled = _as_bool(mine_cfg.get("enabled", priv_cfg.get("mine_enabled", False)))
+        mine_lambda = _as_float(mine_cfg.get("lambda", priv_cfg.get("mine_lambda", 0.0)), 0.0)
 
         self.priv_cfg = privacy_cfg
         self.priv_reg = reg
@@ -198,48 +192,70 @@ class HybridGenerator:
         mmd_vae_sum, mmd_vae_cnt = 0.0, 0
 
         # MINE for VAE (x,z)
-        latent_dim = self.vae.mu.out_features
-        mine_vae = MINE(x_dim=Xc.shape[1], z_dim=latent_dim, hidden=128, ma_rate=0.01).to(self.device) if mine_enabled else None
-        mine_vae_opt = torch.optim.Adam(mine_vae.parameters(), lr=1e-4) if mine_vae else None
+        if mine_enabled and mine_lambda > 0.0:
+            latent_dim = self.vae.mu.out_features
+            mine_vae = MINE(x_dim=Xc.shape[1], z_dim=latent_dim, hidden=128, ma_rate=0.01).to(self.device)
+            mine_vae_opt = torch.optim.Adam(mine_vae.parameters(), lr=1e-4)
+        else:
+            mine_vae, mine_vae_opt = None, None
 
         for _ in range(epochs_vae):
             for (xb,) in loader:
                 xb = xb.to(self.device, non_blocking=True)
-                with _autocast_ctx(cuda_on):
-                    recon, mu_t, logvar = self.vae(xb)
-                    loss, _ = TabularVAE.loss_fn(recon, xb, mu_t, logvar)
 
-                    # Mild MMD on recon vs input to help dispersion (utility-leaning)
+                # ---- (1) MINE critic step on DETACHED tensors (no VAE graph) ----
+                if mine_vae is not None:
+                    with torch.no_grad():
+                        mu_d, logvar_d = self.vae.encode(xb)              # no graph
+                        z_d = self.vae.reparam(mu_d, logvar_d)             # no graph
+                    mine_vae_opt.zero_grad(set_to_none=True)
+                    with _autocast_ctx(cuda_on):
+                        mine_loss_train, _ = mine_vae(x=xb.detach(), z=z_d.detach())  # loss=-MI
+                    mine_loss_train.backward()
+                    mine_vae_opt.step()
+
+                # ---- (2) VAE step: single backward; MINE is FROZEN here ----
+                with _autocast_ctx(cuda_on):
+                    recon, mu_t, logvar_t = self.vae(xb)
+                    vae_loss, _ = TabularVAE.loss_fn(recon, xb, mu_t, logvar_t)
+                    total_loss = vae_loss
+
+                    # MMD (optional)
                     if reg_enabled and reg_lam_v > 0.0:
                         mmd_v = _rbf_mmd2(recon, xb.detach(), sigma=reg_sigma)
-                        loss = loss + reg_lam_v * mmd_v
+                        total_loss = total_loss + reg_lam_v * mmd_v
                     else:
                         mmd_v = None
 
-                    # ---- MINE (VAE): penalize MI(x,z) to discourage memorization ----
-                    if mine_vae and mine_lambda > 0.0:
-                        # update critic: maximize MI -> minimize (-MI)
-                        mine_vae_opt.zero_grad(set_to_none=True)
-                        mine_loss, _ = mine_vae(x=xb.detach(), z=mu_t.detach())
-                        # critic step
-                        mine_loss.backward()
-                        mine_vae_opt.step()
-                        # penalize MI for encoder: add λ * MI == λ * (-mine_loss * -1)
-                        loss = loss + mine_lambda * (-mine_loss)
-                        # log MI estimate
-                        mi_val = float((-mine_loss).detach().cpu())
-                        self.train_logs['mi_est_vae_sum'] = self.train_logs.get('mi_est_vae_sum', 0.0) + mi_val
-                        self.train_logs['mi_est_vae_cnt'] = self.train_logs.get('mi_est_vae_cnt', 0) + 1
+                    # MINE penalty (reduce MI): add λ * (-loss_eval)
+                    if mine_vae is not None and mine_lambda > 0.0:
+                        for p in mine_vae.parameters():
+                            p.requires_grad_(False)
+                        z_eval = self.vae.reparam(mu_t, logvar_t)   # grad flows to encoder
+                        mine_loss_eval, _ = mine_vae(x=xb.detach(), z=z_eval)
+                        total_loss = total_loss + mine_lambda * (-mine_loss_eval)
+                    else:
+                        mine_loss_eval = None
 
                 opt.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
+                scaler.scale(total_loss).backward()  # single backward through VAE
                 if dp:
                     scaler.unscale_(opt); clip_and_noise_(self.vae, dp)
                 scaler.step(opt); scaler.update(); steps += 1
 
+                if mine_vae is not None:
+                    for p in mine_vae.parameters():
+                        p.requires_grad_(True)
+
                 if mmd_v is not None and torch.isfinite(mmd_v):
                     mmd_vae_sum += float(mmd_v.detach().cpu())
                     mmd_vae_cnt += 1
+
+                # logging MI estimate (optional)
+                if mine_loss_eval is not None:
+                    mi_val = float((-mine_loss_eval).detach().cpu())
+                    self.train_logs['mi_est_vae_sum'] = self.train_logs.get('mi_est_vae_sum', 0.0) + mi_val
+                    self.train_logs['mi_est_vae_cnt'] = self.train_logs.get('mi_est_vae_cnt', 0) + 1
 
         if dp:
             if dp.noise_multiplier > 0:
@@ -258,8 +274,8 @@ class HybridGenerator:
 
         # 4) GAN on residuals (AMP-compatible)
         with torch.no_grad():
-            recon, _, _ = self.vae(Xc.to(self.device))
-        resid = (Xc.to(self.device) - recon).cpu().numpy()
+            recon_all, _, _ = self.vae(Xc.to(self.device))
+        resid = (Xc.to(self.device) - recon_all).cpu().numpy()
         R = torch.tensor(resid, dtype=torch.float32)
         z_dim = min(32, R.shape[1] * 2)
         self.gan_G = Generator(z_dim=z_dim, x_dim=R.shape[1]).to(self.device)
@@ -274,19 +290,18 @@ class HybridGenerator:
         d_scaler = _make_scaler(cuda_on)
 
         # MINE for GAN (real_resid, fake_resid)
-        if mine_enabled:
+        if mine_enabled and mine_lambda > 0.0:
             mine_gan = MINE(x_dim=R.shape[1], z_dim=R.shape[1], hidden=128, ma_rate=0.01).to(self.device)
             mine_gan_opt = torch.optim.Adam(mine_gan.parameters(), lr=1e-4)
         else:
-            mine_gan = None
-            mine_gan_opt = None
+            mine_gan, mine_gan_opt = None, None
 
         mmd_g_sum, mmd_g_cnt = 0.0, 0
         for _ in range(epochs_gan):
             for (rb,) in data_loader:
                 rb = rb.to(self.device, non_blocking=True)
 
-                # Critic
+                # --- Critic ---
                 z = torch.randn(rb.size(0), z_dim, device=self.device)
                 with _autocast_ctx(cuda_on):
                     fake = self.gan_G(z)
@@ -300,32 +315,38 @@ class HybridGenerator:
                     d_scaler.unscale_(d_opt); clip_and_noise_(self.gan_D, dp)
                 d_scaler.step(d_opt); d_scaler.update()
 
-                # Generator
+                # --- MINE critic update on detached tensors ---
+                if mine_gan is not None:
+                    mine_gan_opt.zero_grad(set_to_none=True)
+                    with _autocast_ctx(cuda_on):
+                        mine_loss_g_train, _ = mine_gan(x=rb.detach(), z=fake.detach())  # loss=-MI
+                    mine_loss_g_train.backward()
+                    mine_gan_opt.step()
+
+                # --- Generator ---
                 z = torch.randn(rb.size(0), z_dim, device=self.device)
                 with _autocast_ctx(cuda_on):
                     fake = self.gan_G(z)
                     g_loss = -self.gan_D(fake).mean()
 
-                    # Privacy–utility MMD on residuals
+                    # MMD (optional)
                     if reg_enabled and reg_lam_g > 0.0:
                         mmd_g = _rbf_mmd2(fake, rb.detach(), sigma=reg_sigma)
                         if reg_mode == "repulsive":
-                            g_loss = g_loss - reg_lam_g * mmd_g   # privacy-leaning
+                            g_loss = g_loss - reg_lam_g * mmd_g
                         else:
-                            g_loss = g_loss + reg_lam_g * mmd_g   # utility-leaning
+                            g_loss = g_loss + reg_lam_g * mmd_g
                     else:
                         mmd_g = None
 
-                    # ---- MINE (GAN): penalize MI(real_resid, fake_resid) ----
-                    if mine_gan and mine_lambda > 0.0:
-                        mine_gan_opt.zero_grad(set_to_none=True)
-                        mine_loss_g, _ = mine_gan(x=rb.detach(), z=fake.detach())
-                        mine_loss_g.backward()
-                        mine_gan_opt.step()
-                        g_loss = g_loss + mine_lambda * (-mine_loss_g)  # add λ * MI
-                        mi_val_g = float((-mine_loss_g).detach().cpu())
-                        self.train_logs['mi_est_gan_sum'] = self.train_logs.get('mi_est_gan_sum', 0.0) + mi_val_g
-                        self.train_logs['mi_est_gan_cnt'] = self.train_logs.get('mi_est_gan_cnt', 0) + 1
+                    # MINE penalty (reduce MI(real,fake)): add λ * (-loss_eval) with MINE frozen
+                    if mine_gan is not None and mine_lambda > 0.0:
+                        for p in mine_gan.parameters():
+                            p.requires_grad_(False)
+                        mine_loss_g_eval, _ = mine_gan(x=rb.detach(), z=fake)  # grad flows to G via fake
+                        g_loss = g_loss + mine_lambda * (-mine_loss_g_eval)
+                    else:
+                        mine_loss_g_eval = None
 
                 g_opt.zero_grad(set_to_none=True)
                 g_scaler.scale(g_loss).backward()
@@ -333,9 +354,18 @@ class HybridGenerator:
                     g_scaler.unscale_(g_opt); clip_and_noise_(self.gan_G, dp)
                 g_scaler.step(g_opt); g_scaler.update(); steps += 1
 
+                if mine_gan is not None:
+                    for p in mine_gan.parameters():
+                        p.requires_grad_(True)
+
                 if mmd_g is not None and torch.isfinite(mmd_g):
                     mmd_g_sum += float(mmd_g.detach().cpu())
                     mmd_g_cnt += 1
+
+                if mine_loss_g_eval is not None:
+                    mi_val_g = float((-mine_loss_g_eval).detach().cpu())
+                    self.train_logs['mi_est_gan_sum'] = self.train_logs.get('mi_est_gan_sum', 0.0) + mi_val_g
+                    self.train_logs['mi_est_gan_cnt'] = self.train_logs.get('mi_est_gan_cnt', 0) + 1
 
         if dp:
             if dp.noise_multiplier > 0:

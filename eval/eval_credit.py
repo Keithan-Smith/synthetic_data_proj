@@ -625,6 +625,10 @@ def challenger_gbm_synth_to_real(
     except Exception:
         auc = float("nan")
 
+    # --- SAVE SCORES FOR DELONG ---
+    scores_path = os.path.join(out_dir, f"{name}_scores_real.csv")
+    pd.DataFrame({"y": y_te.astype(int), "score": s_real.astype(float)}).to_csv(scores_path, index=False)
+
     # CAP/AR, KS and ROC/PR
     cap = cap_curve_and_ar(pd.Series(y_te), pd.Series(s_real), out_dir, name=f"{name}_cap", annotate=True)
     ks  = ks_statistic(pd.Series(y_te), pd.Series(s_real), out_dir, name=f"{name}_ks")
