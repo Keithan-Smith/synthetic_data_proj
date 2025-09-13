@@ -484,6 +484,7 @@ def run(cfg_path: str):
                privacy_cfg=privacy_cfg,
                privacy_reg_cfg=privacy_reg_cfg,
                mine_cfg=mine_cfg)
+        
     except Exception as e:
         raise RuntimeError(f"Failed to initialize/train HybridGenerator. "
                            f"cont_cols={cont_cols}, cat_cols={cat_cols}. "
@@ -688,7 +689,7 @@ def run(cfg_path: str):
                 batch=getattr(cfg, "batch_size", 256),
                 privacy_cfg=privacy_cfg2,
                 privacy_reg_cfg=privreg_off,
-                mine_cfg={"enabled": False, "lambda": 0.0}
+                mine_cfg=mine_cfg
             )
             syn_noreg = hg_noreg.sample(len(df), shock=_parse_shock_from_cfg(cfg) if _parse_bool(getattr(cfg,"shock_enabled",False)) else ShockSpec())
             if pdcal is not None:
@@ -722,7 +723,7 @@ def run(cfg_path: str):
             os.makedirs(bdir, exist_ok=True)
             syn_noreg.to_csv(os.path.join(bdir, "originations_synth.csv"), index=False)
             fid_b.to_csv(os.path.join(bdir, "fidelity_univariate.csv"), index=False)
-            with open(os.path.join(bdir, "summary.txt"), "w") as f:
+            with open(os.path.join(bdir, "summary.txt"), "w", encoding="utf-8") as f:
                 f.write(f"Ablation (no priv-regularizer)\n")
                 f.write(f"Correlation avg abs diff: {corr_b['avg_abs_corr_diff']:.4f}\n")
                 f.write(f"Utility PD AUC(synth->real): {util_b.get('auc')}\n")
@@ -754,7 +755,7 @@ def run(cfg_path: str):
     df.to_csv(f"{out}/originations_real.csv", index=False)
     syn_o.to_csv(f"{out}/originations_synth.csv", index=False)
     fid.to_csv(f"{out}/fidelity_univariate.csv", index=False)
-    with open(f"{out}/summary.txt","w") as f:
+    with open(f"{out}/summary.txt", "w", encoding="utf-8") as f:
         f.write(f"Correlation avg abs diff: {corr['avg_abs_corr_diff']:.4f}\n")
         f.write(f"Utility PD AUC(synth->real): {util.get('auc')}\n")
         f.write(f"Utility PD Brier(synth->real): {util.get('brier')}\n")
@@ -793,6 +794,29 @@ def run(cfg_path: str):
         build_report(out)
     except Exception as e:
         with open(f"{out}/pipeline_warning.txt","a") as f: f.write("\n[report] "+str(e))
+
+        # --- Optional: auto DeLong compare to a previous run's output ---
+    try:
+        other_dir = getattr(cfg, "compare_to_output_dir", None)
+        if other_dir:
+            from eval.delong import delong_two_model_test
+            here_scores = os.path.join(cfg.output_dir, "credit_eval", "gbm_scores_real.csv")
+            other_scores = os.path.join(other_dir, "credit_eval", "gbm_scores_real.csv")
+            if os.path.exists(here_scores) and os.path.exists(other_scores):
+                A = pd.read_csv(here_scores)
+                B = pd.read_csv(other_scores)
+                if len(A) == len(B) and (A["y"].astype(int).values == B["y"].astype(int).values).all():
+                    res = delong_two_model_test(A["y"].astype(int).values, A["score"].values, B["score"].values)
+                    with open(os.path.join(cfg.output_dir, "auc_delong_comparison.txt"), "w", encoding="utf-8") as f:
+                        f.write("DeLong AUC delta (this run vs compare_to_output_dir)\n")
+                        for k, v in res.items():
+                            f.write(f"{k}: {v}\n")
+                else:
+                    with open(os.path.join(cfg.output_dir, "auc_delong_comparison.txt"), "w", encoding="utf-8") as f:
+                        f.write("Label mismatch between runs; cannot compute DeLong.\n")
+    except Exception as e:
+        with open(f"{cfg.output_dir}/pipeline_warning.txt","a", encoding="utf-8") as f:
+            f.write("\n[delong_compare] " + str(e))
 
 
 if __name__ == "__main__":
