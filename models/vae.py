@@ -21,9 +21,9 @@ class TabularVAE(nn.Module):
         return self.mu(h), self.logvar(h)
 
     def reparam(self, mu, logvar):
-        std = torch.exp(0.5*logvar)
+        std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
-        return mu + eps*std
+        return mu + eps * std
 
     def forward(self, x):
         mu, logvar = self.encode(x)
@@ -33,6 +33,6 @@ class TabularVAE(nn.Module):
 
     @staticmethod
     def loss_fn(recon, x, mu, logvar):
-        recon_loss = nn.functional.mse_loss(recon, x, reduction='mean')
+        recon_loss = nn.functional.mse_loss(recon, x, reduction="mean")
         kld = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-        return recon_loss + 0.001*kld, {'recon': recon_loss.item(), 'kld': kld.item()}
+        return recon_loss + 0.001 * kld, {"recon": recon_loss.item(), "kld": kld.item()}

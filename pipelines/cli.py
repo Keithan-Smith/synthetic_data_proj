@@ -1,5 +1,5 @@
 import argparse, yaml
-from pipelines.learn_from_csv import run as run_universal
+from learn_from_csv import run as run_universal
 
 def main():
     p = argparse.ArgumentParser()

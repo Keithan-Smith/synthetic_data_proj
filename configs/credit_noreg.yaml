@@ -1,0 +1,104 @@
+mode: "learned"
+adapter: "universal"
+
+data_source: "ucimlrepo"
+uci_id: 144
+
+# Paths are relative to this YAML
+column_map: "column_map_credit.yaml"  
+domain_pack: "alias_pack_credit.yaml"    
+
+# Simulator mapping used in credit_portfolio task
+purpose_to_asset:
+  "car (new)": vehicle
+  "car (used)": vehicle
+  "furniture/equipment": unsecured
+  "radio/TV": unsecured
+  "domestic appliances": unsecured
+  "repairs": unsecured
+  "education": unsecured
+  "vacation": unsecured
+  "retraining": unsecured
+  "business": business
+  "other": unsecured
+
+output_dir: "outputs/credit_noreg"
+seed: 242
+device: "cuda"
+
+task: "credit_portfolio"
+months: 18
+start_date: "2019-01-31"
+init_customers: 100000
+base_new: 120
+
+training_profile: thorough
+
+# === Privacy (formal DP) ===
+privacy_enabled: true
+dp_max_grad_norm: 1.0
+dp_noise_multiplier: 0.6
+dp_delta: 1e-5
+
+# === Privacy–Utility Regularizer (MMD) ===
+privreg_enabled: false
+privreg_mode: "repulsive"         # privacy-leaning
+privreg_lambda_gan: 1.0
+privreg_lambda_vae: 0.25
+privreg_mmd_bandwidth: 1.0
+
+# MINE (privacy–utility regularizer)
+mine_enabled: false
+mine_lambda: 0.2
+
+# === Baselines / Ablations ===
+run_baselines: true               # writes outputs/.../baselines/no_privreg
+
+# === Visual dispersion helper (plots only) ===
+disperse_quantiles: true
+
+# === Feature lists (German Credit) ===
+# Standardize naming: use "loan_term" (months)
+cont_cols: ["loan_term","loan_amount","age"]
+cat_cols:
+  ["checking_status","credit_history","purpose","savings","employment_since",
+   "installment_rate_pct","personal_status_sex","other_debtors","residence_since",
+   "property","other_installment_plans","housing","existing_credits",
+   "job","telephone","foreign_worker"]
+
+
+# === PD calibration (real-data driven) ===
+pdcal:
+  mode: auto
+  horizon_months: 12
+  max_cont: 8
+  max_cat: 8
+  max_cat_levels: 30
+  include: []
+  exclude: ["^id$", "^index$", "^name$"]
+
+# Target average PD used when we calibrate panel PDs
+pd_target_rate: 0.02
+
+# === Privacy/Utility sweep ===
+sweep:
+  enabled: false
+  dp_noise_list: [0.0, 0.3, 0.6, 0.9]
+  mmd_lambda_gan_list: [0.0, 0.25, 0.5, 1.0]
+  mmd_mode: "repulsive"
+  mmd_lambda_vae_factor: 0.25
+  grid: false
+
+# === Shocks OFF (keep spec but disabled) ===
+shock_enabled: false
+shock:
+  corr_shrink: 0.25
+  corr_pairs: []
+  cont_mu_shift: {}
+  cont_scale: {}
+  residual_scale: 1.0
+  cat_logit_bias: {}
+
+# Optional eval quality-of-life
+viz_top_k: 12
+eval_minimal: true
